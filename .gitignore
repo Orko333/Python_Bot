@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtualenv
+venv/
+ENV/
+.env/
+.venv/
+
+# VSCode
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env files
+.env
+.env.*
+venv/
+
+# SQLite
+*.sqlite3
+*.db
+
+# Logs
+*.log
+
+# PyInstaller
+*.spec
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# MyPy
+.mypy_cache/
+
+# Coverage
+htmlcov/
+.coverage
+.coverage.*
+.cache
+
+# Test
+.tox/
+pytest_cache/
+
+# Other
+*.bak
+*.swp
+*.swo
+
+# Telegram bot data
+/data/ 
