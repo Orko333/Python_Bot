@@ -3,312 +3,703 @@ import os
 from aiogram import types, Router
 from aiogram.filters import Command
 from aiogram import Bot
-from app.config import Config
-from app.handlers.feedback import request_feedback
+from app.config import Config, ORDER_STATUSES, STATUS_COLORS, SPAM_LIMITS
+# from app.handlers.feedback import request_feedback
 from collections import Counter
 from datetime import datetime, timedelta
-from app.db import get_orders, get_order_by_num, find_orders, update_order_status, add_promocode, get_promocode, get_promocode_usages
+from app.db import (
+    get_orders, get_order_by_num, find_orders, update_order_status, 
+    add_promocode, get_promocode, get_promocode_usages, get_order_by_id,
+    create_backup, check_spam_protection
+)
 import re
 from aiogram.filters.command import CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 router = Router()
-ORDERS_FILE = "orders.json"
 
-# Функція для збереження замовлення
-def save_order(order: dict):
-    orders = []
-    if os.path.exists(ORDERS_FILE):
-        with open(ORDERS_FILE, "r", encoding="utf-8") as f:
-            try:
-                orders = json.load(f)
-            except Exception:
-                orders = []
-    orders.append(order)
-    with open(ORDERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(orders, f, ensure_ascii=False, indent=2)
+class BroadcastStates(StatesGroup):
+    waiting_for_message = State()
+    waiting_for_confirmation = State()
 
-# Функція для отримання замовлень користувача
-def get_user_orders(user_id: int):
-    if not os.path.exists(ORDERS_FILE):
-        return []
-    with open(ORDERS_FILE, "r", encoding="utf-8") as f:
-        try:
-            orders = json.load(f)
-        except Exception:
-            return []
-    return [o for o in orders if o.get("user_id") == user_id]
+def get_admin_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+            [InlineKeyboardButton(text="📢 Масові розсилки", callback_data="admin_broadcast")],
+            [InlineKeyboardButton(text="💾 Створити бекап", callback_data="admin_backup")],
+            [InlineKeyboardButton(text="🎫 Управління промокодами", callback_data="admin_promos")],
+            [InlineKeyboardButton(text="🔧 Налаштування", callback_data="admin_settings")]
+        ]
+    )
 
 @router.message(Command("cabinet"))
-async def cabinet_handler(message: types.Message):
+async def cabinet_handler(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
-    orders = get_orders(user_id=user_id)
-    if not orders:
-        await message.answer("У вас ще немає замовлень.")
-        return
-    text = "<b>Ваші замовлення:</b>\n"
-    for i, o in enumerate(orders, 1):
-        text += (
-            f"\n<b>{i} (ID:{o[0]})</b> {o[6]}\n"  # type_label + номер
-            f"Тема: {o[8]}\n"         # topic
-            f"Дедлайн: {o[10]}\n"      # deadline
-            f"Ціна: {o[13]} грн\n"     # price
-            f"Статус: {o[14]}\n"       # status
+    try:
+        await message.delete()
+        data = await state.get_data()
+        last_info_id = data.get('last_info_message_id')
+        if last_info_id:
+            try:
+                await message.bot.delete_message(message.chat.id, last_info_id)
+            except: pass
+        if user_id in Config.ADMIN_IDS:
+            print(f"[INFO] /cabinet: admin {user_id} - перенаправлено на /cabinet_ad")
+            sent = await message.answer("❗️ Для адміністратора використовуйте /cabinet_ad", parse_mode="HTML")
+            await state.update_data(last_info_message_id=sent.message_id)
+            return
+        # Звичайний користувач
+        orders = get_orders(user_id=user_id)
+        if not orders:
+            print(f"[INFO] /cabinet: user {user_id} - немає замовлень")
+            sent = await message.answer(
+                "📋 <b>Мої замовлення</b>\n\n"
+                "У вас поки немає замовлень.\n"
+                "Створіть перше замовлення командою /order",
+                parse_mode="HTML"
+            )
+            await state.update_data(last_info_message_id=sent.message_id)
+            return
+        text = "📋 <b>Мої замовлення:</b>\n\n"
+        for order in orders[:10]:  # Показуємо останні 10
+            order_id, _, _, _, _, type_label, _, topic, _, deadline, _, _, _, price, status, created_at = order[:16]
+            status_emoji = STATUS_COLORS.get(status, "⚪")
+            status_text = ORDER_STATUSES.get(status, status)
+            text += f"{status_emoji} <b>#{order_id}</b> - {type_label}\n"
+            text += f"📖 {topic[:50]}{'...' if len(topic) > 50 else ''}\n"
+            text += f"💰 {price} грн | 📅 {deadline}\n"
+            text += f"📊 Статус: {status_text}\n\n"
+        if len(orders) > 10:
+            text += f"... та ще {len(orders) - 10} замовлень"
+        sent = await message.answer(text, parse_mode="HTML", reply_markup=None)
+        await state.update_data(last_info_message_id=sent.message_id)
+        print(f"[INFO] /cabinet: user {user_id} - показано {len(orders)} замовлень")
+    except Exception as e:
+        print(f"[ERROR] /cabinet: user {user_id} - {e}")
+        sent = await message.answer("Сталася помилка при отриманні кабінету.")
+        await state.update_data(last_info_message_id=sent.message_id)
+
+@router.message(Command("cabinet_ad"))
+async def cabinet_admin_handler(message: types.Message):
+    user_id = message.from_user.id
+    try:
+        await message.delete()
+        if user_id not in Config.ADMIN_IDS:
+            print(f"[ERROR] /cabinet_ad: user {user_id} не є адміністратором")
+            await message.answer("⛔️ Доступ лише для адміністратора", parse_mode="HTML")
+            return
+        keyboard = get_admin_keyboard()
+        await message.answer(
+            "🔧 <b>Адміністративний кабінет</b>\n\n"
+            "Оберіть потрібну функцію:",
+            parse_mode="HTML",
+            reply_markup=keyboard
         )
-    await message.answer(text, parse_mode="HTML")
+        print(f"[INFO] /cabinet_ad: admin {user_id} - відкрито адмін-кабінет")
+    except Exception as e:
+        print(f"[ERROR] /cabinet_ad: user {user_id} - {e}")
+        await message.answer("Сталася помилка при відкритті адмін-кабінету.")
+
+@router.callback_query(lambda c: c.data == "admin_stats")
+async def admin_stats_callback(callback: types.CallbackQuery):
+    if callback.from_user.id not in Config.ADMIN_IDS:
+        await callback.answer("Доступ заборонено")
+        return
+    
+    # Збираємо статистику
+    all_orders = get_orders()
+    total_orders = len(all_orders)
+    
+    # Статистика за статусами
+    status_counts = Counter(order[14] for order in all_orders)
+    
+    # Статистика за типами
+    type_counts = Counter(order[5] for order in all_orders)
+    
+    # Статистика за останні 7 днів
+    week_ago = datetime.now() - timedelta(days=7)
+    recent_orders = [order for order in all_orders 
+                    if datetime.fromisoformat(order[15]) > week_ago]
+    
+    # Загальна вартість
+    total_revenue = sum(order[13] for order in all_orders if order[13])
+    
+    stats_text = f"""
+📊 <b>Статистика бота</b>
+
+📈 <b>Загальна статистика:</b>
+• Всього замовлень: {total_orders}
+• Загальна вартість: {total_revenue} грн
+• За останні 7 днів: {len(recent_orders)}
+
+📋 <b>За статусами:</b>
+"""
+    
+    for status, count in status_counts.most_common():
+        status_emoji = STATUS_COLORS.get(status, "⚪")
+        status_text = ORDER_STATUSES.get(status, status)
+        stats_text += f"{status_emoji} {status_text}: {count}\n"
+    
+    stats_text += "\n📝 <b>За типами робіт:</b>\n"
+    for order_type, count in type_counts.most_common():
+        stats_text += f"• {order_type}: {count}\n"
+    
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Експорт статистики", callback_data="export_stats")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_admin")]
+        ]
+    )
+    
+    await callback.message.edit_text(stats_text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+@router.callback_query(lambda c: c.data == "admin_broadcast")
+async def admin_broadcast_callback(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in Config.ADMIN_IDS:
+        await callback.answer("Доступ заборонено")
+        return
+    
+    await state.set_state(BroadcastStates.waiting_for_message)
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_admin")]]
+    )
+    await callback.message.edit_text(
+        "📢 <b>Масові розсилки</b>\n\n"
+        "Надішліть повідомлення для розсилки.\n"
+        "Підтримуються: текст, фото, відео, документи\n\n"
+        "Для скасування напишіть /cancel",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+@router.message(BroadcastStates.waiting_for_message)
+async def process_broadcast_message(message: types.Message, state: FSMContext):
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("Розсилка скасована")
+        return
+    
+    # Зберігаємо повідомлення
+    await state.update_data(
+        message_type=message.content_type,
+        text=message.text if message.text else message.caption,
+        file_id=message.document.file_id if message.document else None,
+        photo_id=message.photo[-1].file_id if message.photo else None,
+        video_id=message.video.file_id if message.video else None
+    )
+    
+    # Показуємо підтвердження
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Підтвердити", callback_data="confirm_broadcast")],
+            [InlineKeyboardButton(text="❌ Скасувати", callback_data="cancel_broadcast")]
+        ]
+    )
+    
+    preview_text = f"""
+📢 <b>Попередній перегляд розсилки:</b>
+
+{message.text or message.caption or 'Медіа повідомлення'}
+
+---
+Користувачів для розсилки: {len(set(order[1] for order in get_orders()))}
+"""
+    
+    await message.answer(preview_text, parse_mode="HTML", reply_markup=keyboard)
+    await state.set_state(BroadcastStates.waiting_for_confirmation)
+
+@router.callback_query(lambda c: c.data == "confirm_broadcast")
+async def confirm_broadcast_callback(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in Config.ADMIN_IDS:
+        await callback.answer("Доступ заборонено")
+        return
+    
+    data = await state.get_data()
+    
+    # Отримуємо унікальних користувачів
+    orders = get_orders()
+    users = set(order[1] for order in orders)
+    
+    sent_count = 0
+    failed_count = 0
+    
+    for user_id in users:
+        try:
+            if data['message_type'] == 'text':
+                await callback.bot.send_message(user_id, data['text'], parse_mode="HTML")
+            elif data['message_type'] == 'document':
+                await callback.bot.send_document(user_id, data['file_id'], caption=data['text'])
+            elif data['message_type'] == 'photo':
+                await callback.bot.send_photo(user_id, data['photo_id'], caption=data['text'])
+            elif data['message_type'] == 'video':
+                await callback.bot.send_video(user_id, data['video_id'], caption=data['text'])
+            
+            sent_count += 1
+            
+        except Exception as e:
+            failed_count += 1
+            print(f"Помилка відправки користувачу {user_id}: {e}")
+    
+    await callback.message.edit_text(
+        f"✅ <b>Розсилка завершена!</b>\n\n"
+        f"📤 Відправлено: {sent_count}\n"
+        f"❌ Помилки: {failed_count}\n"
+        f"📊 Всього користувачів: {len(users)}",
+        parse_mode="HTML"
+    )
+    
+    await state.clear()
+    await callback.answer()
+
+@router.callback_query(lambda c: c.data == "admin_backup")
+async def admin_backup_callback(callback: types.CallbackQuery):
+    if callback.from_user.id not in Config.ADMIN_IDS:
+        await callback.answer("Доступ заборонено")
+        return
+    
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_admin")]]
+    )
+    try:
+        backup_file = create_backup()
+        await callback.message.edit_text(
+            f"✅ <b>Бекап створено!</b>\n\n"
+            f"📁 Файл: {backup_file}\n"
+            f"📅 Час: {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+    except Exception as e:
+        await callback.message.edit_text(
+            f"❌ <b>Помилка створення бекапу:</b>\n{str(e)}",
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+    
+    await callback.answer()
+
+@router.callback_query(lambda c: c.data == "admin_promos")
+async def admin_promos_callback(callback: types.CallbackQuery):
+    if callback.from_user.id not in Config.ADMIN_IDS:
+        await callback.answer("Доступ заборонено")
+        return
+    
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Додати промокод", callback_data="add_promo")],
+            [InlineKeyboardButton(text="📊 Статистика промокодів", callback_data="promo_stats")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_admin")]
+        ]
+    )
+    
+    await callback.message.edit_text(
+        "🎫 <b>Управління промокодами</b>\n\n"
+        "Оберіть потрібну функцію:",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+@router.callback_query(lambda c: c.data == "promo_stats")
+async def promo_stats_callback(callback: types.CallbackQuery):
+    if callback.from_user.id not in Config.ADMIN_IDS:
+        await callback.answer("Доступ заборонено")
+        return
+    
+    # Отримуємо статистику промокодів
+    promocodes = []
+    import sqlite3
+    conn = sqlite3.connect('botdata.sqlite3')
+    c = conn.cursor()
+    c.execute('SELECT * FROM promocodes')
+    promocodes = c.fetchall()
+    conn.close()
+    
+    if not promocodes:
+        await callback.message.edit_text(
+            "📊 <b>Статистика промокодів</b>\n\n"
+            "Промокодів не знайдено.",
+            parse_mode="HTML"
+        )
+        return
+    
+    stats_text = "📊 <b>Статистика промокодів:</b>\n\n"
+    
+    for promo in promocodes:
+        code, discount_type, discount_value, usage_limit, used_count, created_at, expires_at, is_personal, personal_user_id, min_order_amount = promo
+        
+        stats_text += f"🎫 <b>{code}</b>\n"
+        stats_text += f"💰 {discount_value} {'%' if discount_type == 'percent' else 'грн'}\n"
+        stats_text += f"📊 Використано: {used_count}/{usage_limit or '∞'}\n"
+        
+        if expires_at:
+            stats_text += f"⏰ Діє до: {expires_at[:10]}\n"
+        
+        if is_personal:
+            stats_text += f"👤 Персональний для: {personal_user_id}\n"
+        
+        if min_order_amount:
+            stats_text += f"💳 Мін. сума: {min_order_amount} грн\n"
+        
+        stats_text += "\n"
+    
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_promos")]
+        ]
+    )
+    
+    await callback.message.edit_text(stats_text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+@router.callback_query(lambda c: c.data == "back_to_admin")
+async def back_to_admin_callback(callback: types.CallbackQuery):
+    if callback.from_user.id not in Config.ADMIN_IDS:
+        await callback.answer("Доступ заборонено")
+        return
+    
+    keyboard = get_admin_keyboard()
+    await callback.message.edit_text(
+        "🔧 <b>Адміністративний кабінет</b>\n\n"
+        "Оберіть потрібну функцію:",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+# Інші обробники залишаються без змін
+@router.message(Command("orders"))
+async def orders_handler(message: types.Message, state: FSMContext):
+    if message.from_user.id not in Config.ADMIN_IDS:
+        return
+    await message.delete()
+    data = await state.get_data()
+    last_info_id = data.get('last_info_message_id')
+    if last_info_id:
+        try:
+            await message.bot.delete_message(message.chat.id, last_info_id)
+        except: pass
+    orders = get_orders()
+    
+    if not orders:
+        sent = await message.answer("Замовлень не знайдено.")
+        await state.update_data(last_info_message_id=sent.message_id)
+        return
+    
+    text = f"📋 <b>Всі замовлення ({len(orders)}):</b>\n\n"
+    
+    for order in orders[:20]:  # Показуємо перші 20
+        order_id, user_id, first_name, username, _, type_label, _, topic, _, deadline, _, _, _, price, status, created_at = order[:16]
+        
+        status_emoji = STATUS_COLORS.get(status, "⚪")
+        status_text = ORDER_STATUSES.get(status, status)
+        
+        text += f"{status_emoji} <b>#{order_id}</b> - {type_label}\n"
+        text += f"👤 {first_name} (@{username})\n"
+        text += f"📖 {topic[:50]}{'...' if len(topic) > 50 else ''}\n"
+        text += f"💰 {price} грн | 📅 {deadline}\n"
+        text += f"📊 Статус: {status_text}\n\n"
+    
+    if len(orders) > 20:
+        text += f"... та ще {len(orders) - 20} замовлень"
+    sent = await message.answer(text, parse_mode="HTML")
+    await state.update_data(last_info_message_id=sent.message_id)
+
+@router.message(Command("order"))
+async def order_detail_handler(message: types.Message, command: CommandObject, state: FSMContext):
+    if message.from_user.id not in Config.ADMIN_IDS:
+        return
+    await message.delete()
+    data = await state.get_data()
+    last_info_id = data.get('last_info_message_id')
+    if last_info_id:
+        try:
+            await message.bot.delete_message(message.chat.id, last_info_id)
+        except: pass
+    if not command.args:
+        sent = await message.answer("Використання: /order <номер>")
+        await state.update_data(last_info_message_id=sent.message_id)
+        return
+    
+    try:
+        order_num = int(command.args)
+        order_data = get_order_by_id(order_num)
+        
+        if not order_data:
+            sent = await message.answer(f"Замовлення #{order_num} не знайдено.")
+            await state.update_data(last_info_message_id=sent.message_id)
+            return
+        
+        order = order_data['order']
+        files = order_data['files']
+        status_history = order_data['status_history']
+        
+        order_id, user_id, first_name, username, phone, type_label, order_type, topic, subject, deadline, volume, requirements, files_json, price, status, created_at, updated_at, confirmed_at, manager_id, notes = order
+        
+        status_emoji = STATUS_COLORS.get(status, "⚪")
+        status_text = ORDER_STATUSES.get(status, status)
+        
+        text = f"""
+📋 <b>Замовлення #{order_id}</b>
+
+👤 <b>Користувач:</b>
+• Ім'я: {first_name}
+• Username: @{username}
+• ID: {user_id}
+• Телефон: {phone}
+
+📝 <b>Деталі замовлення:</b>
+• Тип: {type_label}
+• Тема: {topic}
+• Предмет: {subject}
+• Термін: {deadline}
+• Обсяг: {volume}
+• Вимоги: {requirements}
+
+💰 <b>Фінанси:</b>
+• Ціна: {price} грн
+• Статус: {status_emoji} {status_text}
+
+📎 <b>Файли:</b> {len(files)} шт.
+
+📅 <b>Дати:</b>
+• Створено: {created_at[:10]}
+• Оновлено: {updated_at[:10] if updated_at else 'Ні'}
+
+📝 <b>Примітки:</b> {notes or 'Немає'}
+"""
+        
+        # Клавіатура для зміни статусу
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=f"{emoji} {text}", callback_data=f"set_status:{order_id}:{status_code}")]
+                for status_code, text in ORDER_STATUSES.items()
+            ] + [
+                [InlineKeyboardButton(text="💬 Написати користувачу", callback_data=f"msg_user:{user_id}")],
+                [InlineKeyboardButton(text="📊 Історія статусів", callback_data=f"status_history:{order_id}")]
+            ]
+        )
+        
+        sent = await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+        await state.update_data(last_info_message_id=sent.message_id)
+        
+    except ValueError:
+        sent = await message.answer("Невірний номер замовлення.")
+        await state.update_data(last_info_message_id=sent.message_id)
 
 @router.message(Command("setstatus"))
-async def setstatus_handler(message: types.Message, bot: Bot):
+async def set_status_handler(message: types.Message, command: CommandObject, state: FSMContext):
     if message.from_user.id not in Config.ADMIN_IDS:
-        await message.answer("⛔ Тільки адміністратор може змінювати статуси.")
         return
-    args = message.text.split()
-    if len(args) != 3:
-        await message.answer("Використання: /setstatus <номер> <статус>\nНаприклад: /setstatus 2 done")
-        return
-    try:
-        order_num = int(args[1])
-        new_status = args[2]
-    except Exception:
-        await message.answer("Невірний формат команди.")
-        return
-    ok, order_id = update_order_status(order_num, new_status)
-    if not ok:
-        await message.answer("Замовлення з таким номером не знайдено.")
-        return
-    o = get_order_by_num(order_num)
-    user_id = o[2]
-    try:
-        await bot.send_message(user_id, f"Статус вашого замовлення №{order_num} змінено на: <b>{new_status}</b>", parse_mode="HTML")
-        if new_status in ["готове", "оплачено", "done", "paid"]:
-            await request_feedback(user_id, bot)
-    except Exception:
-        await message.answer("Не вдалося надіслати сповіщення користувачу.")
-    await message.answer(f"Статус замовлення №{order_num} змінено на {new_status}.")
-
-@router.message(Command("orders"))
-async def admin_orders(message: types.Message):
-    if message.from_user.id not in Config.ADMIN_IDS:
-        await message.answer("⛔ Тільки адміністратор може переглядати всі замовлення.")
-        return
-    args = message.text.split()
-    status_filter = args[1] if len(args) > 1 else None
-    orders = get_orders(status=status_filter)
-    if not orders:
-        await message.answer("Замовлень ще немає.")
-        return
-    # Фільтруємо завершені замовлення
-    completed_statuses = {"готово", "оплачено", "done", "paid", "завершено"}
-    active_orders = [o for o in orders if str(o[14]).lower() not in completed_statuses]
-    # Сортуємо за дедлайном (найближчі зверху)
-    def parse_deadline(o):
+    await message.delete()
+    data = await state.get_data()
+    last_info_id = data.get('last_info_message_id')
+    if last_info_id:
         try:
-            return datetime.strptime(o[10], "%Y-%m-%d")
-        except Exception:
-            return datetime.max
-    active_orders.sort(key=parse_deadline)
-    text = f"<b>Актуальні замовлення (найближчі дедлайни зверху):</b>\n"
-    for i, o in enumerate(active_orders, 1):
-        text += (
-            f"\n<b>{i} (ID:{o[0]})</b> {o[6]}\n"
-            f"Тема: {o[8]}\n"
-            f"Дедлайн: {o[10]}\n"
-            f"Ціна: {o[13]} грн\n"
-            f"Статус: {o[14]}\n"
-            f"user_id: {o[1]}\n"
-        )
-    if not active_orders:
-        text += "\nНемає активних замовлень."
-    await message.answer(text, parse_mode="HTML")
-
-@router.message(Command(re.compile(r"order_(\d+)")))
-async def admin_order_detail_underscore(message: types.Message, command: CommandObject):
-    if message.from_user.id not in Config.ADMIN_IDS:
-        await message.answer("⛔ Тільки адміністратор може переглядати деталі замовлення.")
-        return
-    try:
-        order_num = int(command.command.split('_')[1])
-    except Exception:
-        await message.answer("Невірний формат команди. Приклад: /order_5")
-        return
-    o = get_order_by_num(order_num)
-    if not o:
-        await message.answer("Замовлення з таким номером не знайдено.")
-        return
-    text = (
-        f"<b>Деталі замовлення №{order_num}:</b>\n"
-        f"Тип: {o[6]}\n"
-        f"Тема: {o[7]}\n"
-        f"Предмет: {o[8]}\n"
-        f"Дедлайн: {o[9]}\n"
-        f"Об'єм: {o[10]}\n"
-        f"Вимоги: {o[11]}\n"
-        f"Ціна: {o[13]} грн\n"
-        f"Статус: {o[14]}\n"
-        f"user_id: {o[1]}\n"
-        f"Ім'я: {o[2]}\n"
-        f"username: @{o[3]}\n"
-        f"Телефон: {o[4]}\n"
-    )
-    await message.answer(text, parse_mode="HTML")
-
-@router.message(Command("find"))
-async def admin_find(message: types.Message):
-    if message.from_user.id not in Config.ADMIN_IDS:
-        await message.answer("⛔ Тільки адміністратор може шукати замовлення.")
-        return
-    args = message.text.split(maxsplit=1)
+            await message.bot.delete_message(message.chat.id, last_info_id)
+        except: pass
+    args = command.args.split('_')
     if len(args) != 2:
-        await message.answer("Використання: /find <user_id|username|тема>")
+        sent = await message.answer("Використання: /setstatus <номер>_<статус>")
+        await state.update_data(last_info_message_id=sent.message_id)
         return
-    query = args[1].lower()
-    found = find_orders(query)
-    if not found:
-        await message.answer("Нічого не знайдено.")
-        return
-    text = "<b>Результати пошуку:</b>\n"
-    for i, o in enumerate(found, 1):
-        text += (
-            f"\n<b>{i} (ID:{o[0]})</b> {o[6]}\n"
-            f"Тема: {o[8]}\n"
-            f"Дедлайн: {o[10]}\n"
-            f"Ціна: {o[13]} грн\n"
-            f"Статус: {o[14]}\n"
-            f"user_id: {o[1]}\n"
-        )
-    await message.answer(text, parse_mode="HTML")
+    
+    try:
+        order_id = int(args[0])
+        new_status = args[1]
+        
+        if new_status not in ORDER_STATUSES:
+            sent = await message.answer(f"Невірний статус. Доступні: {', '.join(ORDER_STATUSES.keys())}")
+            await state.update_data(last_info_message_id=sent.message_id)
+            return
+        
+        update_order_status(order_id, new_status, message.from_user.id, "Змінено через команду")
+        
+        sent = await message.answer(f"✅ Статус замовлення #{order_id} змінено на '{ORDER_STATUSES[new_status]}'")
+        await state.update_data(last_info_message_id=sent.message_id)
+        
+    except ValueError:
+        sent = await message.answer("Невірний формат команди.")
+        await state.update_data(last_info_message_id=sent.message_id)
 
 @router.message(Command("stats"))
-async def admin_stats(message: types.Message):
+async def stats_handler(message: types.Message, state: FSMContext):
     if message.from_user.id not in Config.ADMIN_IDS:
-        await message.answer("⛔ Тільки адміністратор може переглядати статистику.")
         return
+    await message.delete()
+    data = await state.get_data()
+    last_info_id = data.get('last_info_message_id')
+    if last_info_id:
+        try:
+            await message.bot.delete_message(message.chat.id, last_info_id)
+        except: pass
     orders = get_orders()
+    
     if not orders:
-        await message.answer("Замовлень ще немає.")
+        sent = await message.answer("Статистика недоступна - немає замовлень.")
+        await state.update_data(last_info_message_id=sent.message_id)
         return
-    # Загальна кількість
-    total = len(orders)
-    # Кількість за статусами
-    status_counter = Counter(o[14] for o in orders)
-    # ТОП-5 типів робіт
-    type_counter = Counter(o[6] for o in orders)
-    # ТОП-5 предметів
-    subject_counter = Counter(o[9] for o in orders)
-    # Середній чек
-    prices = [int(o[13]) for o in orders if str(o[13]).isdigit()]
-    avg_price = int(sum(prices) / len(prices)) if prices else 0
-    # Унікальні користувачі
-    users = set(o[2] for o in orders)
-    # Замовлення за останній місяць/тиждень
-    now = datetime.now().date()
-    month_ago = now - timedelta(days=30)
-    week_ago = now - timedelta(days=7)
-    orders_month = [o for o in orders if o[10] and o[10] >= str(month_ago)]
-    orders_week = [o for o in orders if o[10] and o[10] >= str(week_ago)]
-    # Формуємо текст
-    text = f"<b>Статистика замовлень:</b>\n"
-    text += f"Всього замовлень: <b>{total}</b>\n"
-    text += "\n<b>За статусами:</b>\n" + "\n".join(f"{k}: {v}" for k, v in status_counter.items())
-    text += "\n\n<b>ТОП-5 типів робіт:</b>\n" + "\n".join(f"{k}: {v}" for k, v in type_counter.most_common(5))
-    text += "\n\n<b>ТОП-5 предметів:</b>\n" + "\n".join(f"{k}: {v}" for k, v in subject_counter.most_common(5))
-    text += f"\n\nСередній чек: <b>{avg_price} грн</b>\n"
-    text += f"Унікальних користувачів: <b>{len(users)}</b>\n"
-    text += f"Замовлень за місяць: <b>{len(orders_month)}</b>\n"
-    text += f"Замовлень за тиждень: <b>{len(orders_week)}</b>\n"
-    await message.answer(text, parse_mode="HTML")
+    
+    # Базова статистика
+    total_orders = len(orders)
+    total_revenue = sum(order[13] for order in orders if order[13])
+    
+    # Статистика за статусами
+    status_counts = Counter(order[14] for order in orders)
+    
+    # Статистика за останні 7 днів
+    week_ago = datetime.now() - timedelta(days=7)
+    recent_orders = [order for order in orders 
+                    if datetime.fromisoformat(order[15]) > week_ago]
+    
+    text = f"""
+📊 <b>Статистика бота</b>
+
+📈 <b>Загальна статистика:</b>
+• Всього замовлень: {total_orders}
+• Загальна вартість: {total_revenue} грн
+• За останні 7 днів: {len(recent_orders)}
+
+📋 <b>За статусами:</b>
+"""
+    
+    for status, count in status_counts.most_common():
+        status_emoji = STATUS_COLORS.get(status, "⚪")
+        status_text = ORDER_STATUSES.get(status, status)
+        text += f"{status_emoji} {status_text}: {count}\n"
+    
+    sent = await message.answer(text, parse_mode="HTML")
+    await state.update_data(last_info_message_id=sent.message_id)
 
 @router.message(Command("addpromo"))
-async def addpromo_handler(message: types.Message):
+async def add_promo_handler(message: types.Message, command: CommandObject, state: FSMContext):
     if message.from_user.id not in Config.ADMIN_IDS:
-        await message.answer("⛔ Тільки адміністратор може створювати промокоди.")
         return
-    args = message.text.split()
-    if len(args) != 5:
-        await message.answer("Використання: /addpromo <код> <тип> <значення> <ліміт>\nТип: percent або fixed\nНаприклад: /addpromo SUMMER2024 percent 10 100")
+    await message.delete()
+    data = await state.get_data()
+    last_info_id = data.get('last_info_message_id')
+    if last_info_id:
+        try:
+            await message.bot.delete_message(message.chat.id, last_info_id)
+        except: pass
+    args = command.args.split('_')
+    if len(args) < 4:
+        sent = await message.answer("Використання: /addpromo <код>_<тип>_<значення>_<ліміт>_[термін_дії]")
+        await state.update_data(last_info_message_id=sent.message_id)
         return
-    code, discount_type, discount_value, usage_limit = args[1], args[2], int(args[3]), int(args[4])
-    if discount_type not in ("percent", "fixed"):
-        await message.answer("Тип знижки має бути percent або fixed.")
-        return
-    add_promocode(code.upper(), discount_type, discount_value, usage_limit)
-    await message.answer(f"Промокод {code.upper()} створено!")
+    
+    try:
+        code = args[0].upper()
+        discount_type = args[1]
+        discount_value = int(args[2])
+        usage_limit = int(args[3])
+        expires_at = args[4] if len(args) > 4 else None
+        
+        add_promocode(code, discount_type, discount_value, usage_limit, expires_at)
+        
+        sent = await message.answer(f"✅ Промокод {code} додано!")
+        await state.update_data(last_info_message_id=sent.message_id)
+        
+    except (ValueError, IndexError):
+        sent = await message.answer("Невірний формат команди.")
+        await state.update_data(last_info_message_id=sent.message_id)
 
 @router.message(Command("promos"))
-async def promos_handler(message: types.Message):
+async def promos_handler(message: types.Message, state: FSMContext):
     if message.from_user.id not in Config.ADMIN_IDS:
-        await message.answer("⛔ Тільки адміністратор може переглядати промокоди.")
         return
-    # Виводимо всі промокоди та статистику використань
-    text = "<b>Промокоди:</b>\n"
-    # Для простоти — отримуємо всі промокоди через get_orders і шукаємо унікальні коди
-    orders = get_orders()
-    codes = set()
-    for o in orders:
-        promo = o[15] if len(o) > 15 else None
-        if promo:
-            codes.add(promo)
-    if not codes:
-        text += "Промокодів ще не використовували."
-    for code in codes:
-        promo = get_promocode(code)
-        usages = get_promocode_usages(code)
-        if promo:
-            text += (f"\n<b>{promo[0]}</b>: {promo[1]} {promo[2]} (ліміт: {promo[3]}, використано: {promo[4]})\n"
-                      f"Використань: {len(usages)}\n")
-    await message.answer(text, parse_mode="HTML")
-
-@router.message(Command(re.compile(r"setstatus_(\d+)_(\w+)")))
-async def setstatus_handler_underscore(message: types.Message, command: CommandObject, bot: Bot):
-    if message.from_user.id not in Config.ADMIN_IDS:
-        await message.answer("⛔ Тільки адміністратор може змінювати статуси.")
-        return
-    try:
-        parts = command.command.split('_')
-        order_num = int(parts[1])
-        new_status = parts[2]
-    except Exception:
-        await message.answer("Невірний формат команди. Приклад: /setstatus_5_done")
-        return
-    ok, order_id = update_order_status(order_num, new_status)
-    if not ok:
-        await message.answer("Замовлення з таким номером не знайдено.")
-        return
-    o = get_order_by_num(order_num)
-    user_id = o[1]
-    try:
-        await bot.send_message(user_id, f"Статус вашого замовлення №{order_num} змінено на: <b>{new_status}</b>", parse_mode="HTML")
-        if new_status in ["готове", "оплачено", "done", "paid"]:
-            await request_feedback(user_id, bot)
-    except Exception:
-        await message.answer("Не вдалося надіслати сповіщення користувачу.")
-    await message.answer(f"Статус замовлення №{order_num} змінено на {new_status}.")
-
-class AdminMsgStates(StatesGroup):
-    waiting_for_text = State()
-
-@router.message(Command(re.compile(r"msg_(\d+)")))
-async def admin_msg_start(message: types.Message, command: CommandObject, state: FSMContext):
-    if message.from_user.id not in Config.ADMIN_IDS:
-        await message.answer("⛔ Тільки адміністратор може писати користувачам.")
-        return
-    try:
-        user_id = int(command.command.split('_')[1])
-    except Exception:
-        await message.answer("Невірний формат команди. Приклад: /msg_123456789")
-        return
-    await state.update_data(target_user_id=user_id)
-    await message.answer(f"Введіть текст повідомлення для користувача <code>{user_id}</code>:", parse_mode="HTML")
-    await state.set_state(AdminMsgStates.waiting_for_text)
-
-@router.message(AdminMsgStates.waiting_for_text)
-async def admin_msg_send(message: types.Message, state: FSMContext, bot: Bot):
+    await message.delete()
     data = await state.get_data()
-    user_id = data.get('target_user_id')
+    last_info_id = data.get('last_info_message_id')
+    if last_info_id:
+        try:
+            await message.bot.delete_message(message.chat.id, last_info_id)
+        except: pass
+    # Отримуємо статистику промокодів
+    promocodes = []
+    import sqlite3
+    conn = sqlite3.connect('botdata.sqlite3')
+    c = conn.cursor()
+    c.execute('SELECT * FROM promocodes')
+    promocodes = c.fetchall()
+    conn.close()
+    
+    if not promocodes:
+        sent = await message.answer("Промокодів не знайдено.")
+        await state.update_data(last_info_message_id=sent.message_id)
+        return
+    
+    text = "📊 <b>Статистика промокодів:</b>\n\n"
+    
+    for promo in promocodes:
+        code, discount_type, discount_value, usage_limit, used_count, created_at, expires_at, is_personal, personal_user_id, min_order_amount = promo
+        
+        text += f"🎫 <b>{code}</b>\n"
+        text += f"💰 {discount_value} {'%' if discount_type == 'percent' else 'грн'}\n"
+        text += f"📊 Використано: {used_count}/{usage_limit or '∞'}\n"
+        
+        if expires_at:
+            text += f"⏰ Діє до: {expires_at[:10]}\n"
+        
+        text += "\n"
+    
+    sent = await message.answer(text, parse_mode="HTML")
+    await state.update_data(last_info_message_id=sent.message_id)
+
+@router.message(Command("feedbacks"))
+async def feedbacks_handler(message: types.Message, state: FSMContext):
+    if message.from_user.id not in Config.ADMIN_IDS:
+        return
+    await message.delete()
+    data = await state.get_data()
+    last_info_id = data.get('last_info_message_id')
+    if last_info_id:
+        try:
+            await message.bot.delete_message(message.chat.id, last_info_id)
+        except: pass
+    # Отримуємо відгуки
+    feedbacks = []
+    import sqlite3
+    conn = sqlite3.connect('botdata.sqlite3')
+    c = conn.cursor()
+    c.execute('SELECT * FROM feedbacks ORDER BY created_at DESC')
+    feedbacks = c.fetchall()
+    conn.close()
+    
+    if not feedbacks:
+        sent = await message.answer("Відгуків не знайдено.")
+        await state.update_data(last_info_message_id=sent.message_id)
+        return
+    
+    text = f"📝 <b>Всі відгуки ({len(feedbacks)}):</b>\n\n"
+    
+    for feedback in feedbacks[:10]:  # Показуємо останні 10
+        feedback_id, user_id, username, text_content, stars, created_at = feedback
+        
+        text += f"⭐ <b>{'⭐' * stars}{'☆' * (5 - stars)}</b>\n"
+        text += f"👤 @{username} (ID: {user_id})\n"
+        text += f"📝 {text_content[:100]}{'...' if len(text_content) > 100 else ''}\n"
+        text += f"📅 {created_at[:10]}\n\n"
+    
+    if len(feedbacks) > 10:
+        text += f"... та ще {len(feedbacks) - 10} відгуків"
+    
+    sent = await message.answer(text, parse_mode="HTML")
+    await state.update_data(last_info_message_id=sent.message_id)
+
+@router.callback_query(lambda c: c.data == "user_stats")
+async def user_stats_callback(callback: types.CallbackQuery):
     try:
-        await bot.send_message(user_id, f"<b>Повідомлення від адміністратора:</b>\n{message.text}", parse_mode="HTML")
-        await message.answer("Повідомлення надіслано користувачу.")
-    except Exception:
-        await message.answer("Не вдалося надіслати повідомлення користувачу. Можливо, він не писав боту.")
-    await state.clear() 
+        # Тут можна реалізувати реальну статистику користувача
+        await callback.message.answer("📊 Детальна статистика буде доступна найближчим часом.")
+        await callback.answer()
+        print(f"[INFO] Кабінет: користувач {callback.from_user.id} натиснув 'Детальна статистика'")
+    except Exception as e:
+        print(f"[ERROR] Кабінет: user_stats для {callback.from_user.id} - {e}")
+        await callback.message.answer("Сталася помилка при отриманні статистики.")
+        await callback.answer() 
