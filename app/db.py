@@ -2,6 +2,7 @@ import sqlite3
 from contextlib import closing
 import json
 from datetime import datetime, timedelta
+import random
 
 DB_PATH = 'botdata.sqlite3'
 
@@ -147,6 +148,18 @@ def init_db():
             size_bytes INTEGER
         )''')
         
+        # Таблиця для зберігання всіх переписок
+        c.execute('''CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            chat_id INTEGER,
+            username TEXT,
+            direction TEXT, -- 'user' або 'bot'
+            text TEXT,
+            message_type TEXT,
+            created_at TEXT
+        )''')
+        
         conn.commit()
 
 # --- Функції для роботи з замовленнями ---
@@ -155,30 +168,30 @@ def add_order(user_id, first_name, username, phone_number, type_label, order_typ
     with get_db_connection() as conn:
         c = conn.cursor()
         now = datetime.now().isoformat()
-        
+        # Генеруємо унікальний випадковий id (5-значне число)
+        while True:
+            rand_id = random.randint(10000, 99999)
+            c.execute('SELECT 1 FROM orders WHERE id = ?', (rand_id,))
+            if not c.fetchone():
+                break
         # Конвертуємо файли в JSON
         files_json = json.dumps(files or [])
-        
         c.execute('''INSERT INTO orders 
-                    (user_id, first_name, username, phone_number, type_label, order_type,
+                    (id, user_id, first_name, username, phone_number, type_label, order_type,
                      topic, subject, deadline, volume, requirements, files, price, 
                      status, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)''',
-                 (user_id, first_name, username, phone_number, type_label, order_type,
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)''',
+                 (rand_id, user_id, first_name, username, phone_number, type_label, order_type,
                   topic, subject, deadline, volume, requirements, files_json, price, now, now))
-        
-        order_id = c.lastrowid
-        
+        order_id = rand_id
         # Додаємо файли окремо
         if files:
             for file_id in files:
                 c.execute('''INSERT INTO order_files (order_id, file_id, uploaded_at)
                             VALUES (?, ?, ?)''', (order_id, file_id, now))
-        
         # Додаємо запис в історію статусів
         c.execute('''INSERT INTO order_status_history (order_id, status, changed_at)
                     VALUES (?, 'draft', ?)''', (order_id, now))
-        
         conn.commit()
         return order_id
 
@@ -593,6 +606,14 @@ def find_orders_old(query):
                     WHERE topic LIKE ? OR subject LIKE ? OR requirements LIKE ?
                     ORDER BY created_at DESC''', (search_term, search_term, search_term))
         return c.fetchall()
+
+def log_message(user_id, username, direction, text, chat_id=None, message_type='text'):
+    with get_db_connection() as conn:
+        c = conn.cursor()
+        c.execute('''INSERT INTO messages (user_id, username, direction, text, chat_id, message_type, created_at)
+                     VALUES (?, ?, ?, ?, ?, ?, datetime('now'))''',
+                  (user_id, username, direction, text, chat_id, message_type))
+        conn.commit()
 
 # --- Викликати при старті бота ---
 if __name__ == '__main__':

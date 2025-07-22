@@ -5,10 +5,15 @@ from aiogram.filters import Command
 from datetime import datetime, timedelta
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 from app.config import ORDER_TYPE_PRICES, Config, ORDER_STATUSES, SPAM_LIMITS, MAX_FILES_PER_ORDER, ALLOWED_FILE_TYPES
-from app.db import add_order, get_promocode, is_promocode_valid, use_promocode, update_order, get_order_by_id, check_spam_protection, add_referral_bonus, get_referrals
-from app.utils.validation import validate_topic, validate_subject, validate_deadline, validate_volume, validate_requirements, validate_promocode
+from app.db import add_order, get_promocode, is_promocode_valid, use_promocode, update_order, get_order_by_id, check_spam_protection, add_referral_bonus, get_referrals, log_message
 import json
 import re
+from app.handlers.faq import faq_handler
+from app.handlers.cabinet import cabinet_handler
+from app.handlers.help import help_handler
+from app.handlers.prices import prices_handler
+from app.handlers.start import start_handler
+from app.utils.validation import validate_topic, validate_subject, validate_deadline, validate_volume, validate_requirements, validate_promocode, delete_previous_messages, delete_all_tracked_messages, COMMAND_INPUT, is_command
 
 router = Router()
 
@@ -123,6 +128,88 @@ def get_progress_bar(current_step, total_steps):
 @router.message(Command("order"))
 @router.message(F.text == "📝 Нове замовлення")
 async def order_handler(message: types.Message, state: FSMContext):
+    # Видалити повідомлення про спам, якщо воно є
+    data = await state.get_data()
+    last_info_id = data.get('last_info_message_id')
+    if last_info_id:
+        try:
+            await message.bot.delete_message(message.chat.id, last_info_id)
+        except Exception:
+            pass
+        await state.update_data(last_info_message_id=None)
+    await delete_all_tracked_messages(message.bot, message.chat.id, state)
+    await state.update_data(last_user_message_id=message.message_id)
+    log_message(message.from_user.id, message.from_user.username, 'user', message.text, message.chat.id)
+    current_state = await state.get_state()
+    if current_state and current_state.startswith("OrderStates:"):
+        # Відновити діалог з того місця, де зупинився користувач
+        if current_state == "OrderStates:waiting_for_topic":
+            sent = await message.answer(
+                f"{get_progress_bar(2, 8)}\n\nВведіть тему роботи:",
+                parse_mode="HTML",
+                reply_markup=get_back_keyboard()
+            )
+            await state.update_data(last_bot_message_id=sent.message_id)
+            await state.set_state(OrderStates.waiting_for_topic)
+            return
+        if current_state == "OrderStates:waiting_for_subject":
+            sent = await message.answer(
+                f"{get_progress_bar(3, 8)}\n\nВведіть предмет:",
+                parse_mode="HTML",
+                reply_markup=get_back_keyboard()
+            )
+            await state.update_data(last_bot_message_id=sent.message_id)
+            await state.set_state(OrderStates.waiting_for_subject)
+            return
+        if current_state == "OrderStates:waiting_for_deadline":
+            sent = await message.answer(
+                f"{get_progress_bar(4, 8)}\n\nВведіть термін виконання у форматі ДД.ММ.РРРР (наприклад: 10.10.2010):",
+                parse_mode="HTML",
+                reply_markup=get_back_keyboard()
+            )
+            await state.update_data(last_bot_message_id=sent.message_id)
+            await state.set_state(OrderStates.waiting_for_deadline)
+            return
+        if current_state == "OrderStates:waiting_for_volume":
+            sent = await message.answer(
+                f"{get_progress_bar(5, 8)}\n\nВведіть обсяг роботи (кількість сторінок або робіт):",
+                parse_mode="HTML",
+                reply_markup=get_back_keyboard()
+            )
+            await state.update_data(last_bot_message_id=sent.message_id)
+            await state.set_state(OrderStates.waiting_for_volume)
+            return
+        if current_state == "OrderStates:waiting_for_requirements":
+            sent = await message.answer(
+                f"{get_progress_bar(6, 8)}\n\nВведіть вимоги до роботи:",
+                parse_mode="HTML",
+                reply_markup=get_back_keyboard()
+            )
+            await state.update_data(last_bot_message_id=sent.message_id)
+            await state.set_state(OrderStates.waiting_for_requirements)
+            return
+        if current_state == "OrderStates:waiting_for_files":
+            sent = await message.answer(
+                f"{get_progress_bar(7, 8)}\n\nБажаєте додати файли до замовлення?",
+                parse_mode="HTML",
+                reply_markup=get_back_keyboard()
+            )
+            await state.update_data(last_bot_message_id=sent.message_id)
+            await state.set_state(OrderStates.waiting_for_files)
+            return
+        if current_state == "OrderStates:waiting_for_promocode":
+            sent = await message.answer(
+                f"{get_progress_bar(8, 8)}\n\nВведіть промокод (якщо є):",
+                parse_mode="HTML",
+                reply_markup=get_back_keyboard()
+            )
+            await state.update_data(last_bot_message_id=sent.message_id)
+            await state.set_state(OrderStates.waiting_for_promocode)
+            return
+        if current_state == "OrderStates:waiting_for_confirmation":
+            await show_order_summary(message, state)
+            return
+    # Якщо state немає або не OrderStates — почати нове замовлення
     user_id = message.from_user.id
     try:
         if not check_spam_protection(message.from_user.id, 'order_creation', 
@@ -152,7 +239,7 @@ async def order_handler(message: types.Message, state: FSMContext):
             parse_mode="HTML",
             reply_markup=keyboard
         )
-        await state.update_data(last_info_message_id=sent.message_id)
+        await state.update_data(last_bot_message_id=sent.message_id)
         print(f"[INFO] /order: user {user_id} - order menu sent")
     except Exception as e:
         data = await state.get_data()
@@ -188,9 +275,45 @@ async def order_type_callback(callback: types.CallbackQuery, state: FSMContext):
 
 @router.message(OrderStates.waiting_for_topic)
 async def process_topic(message: types.Message, state: FSMContext):
+    # Видалити повідомлення про спам, якщо воно є
+    data = await state.get_data()
+    last_info_id = data.get('last_info_message_id')
+    if last_info_id:
+        try:
+            await message.bot.delete_message(message.chat.id, last_info_id)
+        except Exception:
+            pass
+        await state.update_data(last_info_message_id=None)
+    await delete_previous_messages(message.bot, message.chat.id, state)
+    await state.update_data(last_user_message_id=message.message_id)
+    log_message(message.from_user.id, message.from_user.username, 'user', message.text, message.chat.id)
+    if is_command(message.text):
+        # Очищати стан лише якщо це /order або /start
+        if message.text == '/order' or message.text == '/start':
+            await state.clear()
+            await order_handler(message, state)
+            return
+        if message.text == '/faq':
+            await faq_handler(message, state)
+        elif message.text == '/cabinet':
+            await cabinet_handler(message, state)
+        elif message.text == '/help':
+            await help_handler(message, state)
+        elif message.text == '/prices':
+            await prices_handler(message, state)
+        return
+    is_valid, error_message = validate_topic(message.text)
+    if is_valid is None and error_message == COMMAND_INPUT:
+        return False
     data = await state.get_data()
     last_bot_message_id = data.get('last_bot_message_id')
     last_info_id = data.get('last_info_message_id')
+    error_message_id = data.get('error_message_id')
+    if error_message_id:
+        try:
+            await message.bot.delete_message(message.chat.id, error_message_id)
+        except: pass
+        await state.update_data(error_message_id=None)
 
     if message.text == "🔙 Назад":
         keyboard = InlineKeyboardMarkup(
@@ -204,7 +327,7 @@ async def process_topic(message: types.Message, state: FSMContext):
                 await message.bot.delete_message(message.chat.id, last_info_id)
             except: pass
         sent = await message.answer("Оберіть тип роботи:", reply_markup=keyboard)
-        await state.update_data(last_info_message_id=sent.message_id)
+        await state.update_data(last_bot_message_id=sent.message_id)
         await state.set_state(OrderStates.waiting_for_type)
         return
     
@@ -216,19 +339,6 @@ async def process_topic(message: types.Message, state: FSMContext):
         sent = await message.answer("Створення замовлення скасовано.", reply_markup=get_main_menu_keyboard())
         await state.update_data(last_info_message_id=sent.message_id)
         await state.clear()
-        return
-    
-    is_valid, error_message = validate_topic(message.text)
-    if not is_valid:
-        if last_info_id:
-            try:
-                await message.bot.delete_message(message.chat.id, last_info_id)
-            except: pass
-        try:
-            await message.delete()
-        except: pass
-        sent = await message.answer(f"⚠️ {error_message}")
-        await state.update_data(last_info_message_id=sent.message_id)
         return
     
     if last_bot_message_id:
@@ -252,9 +362,45 @@ async def process_topic(message: types.Message, state: FSMContext):
 
 @router.message(OrderStates.waiting_for_subject)
 async def process_subject(message: types.Message, state: FSMContext):
+    # Видалити повідомлення про спам, якщо воно є
+    data = await state.get_data()
+    last_info_id = data.get('last_info_message_id')
+    if last_info_id:
+        try:
+            await message.bot.delete_message(message.chat.id, last_info_id)
+        except Exception:
+            pass
+        await state.update_data(last_info_message_id=None)
+    await delete_previous_messages(message.bot, message.chat.id, state)
+    await state.update_data(last_user_message_id=message.message_id)
+    log_message(message.from_user.id, message.from_user.username, 'user', message.text, message.chat.id)
+    if is_command(message.text):
+        # Очищати стан лише якщо це /order або /start
+        if message.text == '/order' or message.text == '/start':
+            await state.clear()
+            await order_handler(message, state)
+            return
+        if message.text == '/faq':
+            await faq_handler(message, state)
+        elif message.text == '/cabinet':
+            await cabinet_handler(message, state)
+        elif message.text == '/help':
+            await help_handler(message, state)
+        elif message.text == '/prices':
+            await prices_handler(message, state)
+        return
+    is_valid, error_message = validate_subject(message.text)
+    if is_valid is None and error_message == COMMAND_INPUT:
+        return False
     data = await state.get_data()
     last_bot_message_id = data.get('last_bot_message_id')
     last_info_id = data.get('last_info_message_id')
+    error_message_id = data.get('error_message_id')
+    if error_message_id:
+        try:
+            await message.bot.delete_message(message.chat.id, error_message_id)
+        except: pass
+        await state.update_data(error_message_id=None)
 
     if message.text == "🔙 Назад":
         if last_info_id:
@@ -291,19 +437,6 @@ async def process_subject(message: types.Message, state: FSMContext):
         await state.clear()
         return
     
-    is_valid, error_message = validate_subject(message.text)
-    if not is_valid:
-        if last_info_id:
-            try:
-                await message.bot.delete_message(message.chat.id, last_info_id)
-            except: pass
-        try:
-            await message.delete()
-        except: pass
-        sent = await message.answer(f"⚠️ {error_message}")
-        await state.update_data(last_info_message_id=sent.message_id)
-        return
-        
     if last_bot_message_id:
         try:
             await message.bot.delete_message(message.chat.id, last_bot_message_id)
@@ -316,7 +449,7 @@ async def process_subject(message: types.Message, state: FSMContext):
     keyboard = get_back_keyboard()
     prompt_message = await message.answer(
         f"{get_progress_bar(4, 8)}\n\n"
-        "Введіть термін виконання (наприклад: 7 днів, 2 тижні):",
+        "Введіть термін виконання у форматі ДД.ММ.РРРР (наприклад: 10.10.2010):",
         parse_mode="HTML",
         reply_markup=keyboard
     )
@@ -325,9 +458,45 @@ async def process_subject(message: types.Message, state: FSMContext):
 
 @router.message(OrderStates.waiting_for_deadline)
 async def process_deadline(message: types.Message, state: FSMContext):
+    # Видалити повідомлення про спам, якщо воно є
+    data = await state.get_data()
+    last_info_id = data.get('last_info_message_id')
+    if last_info_id:
+        try:
+            await message.bot.delete_message(message.chat.id, last_info_id)
+        except Exception:
+            pass
+        await state.update_data(last_info_message_id=None)
+    await delete_previous_messages(message.bot, message.chat.id, state)
+    await state.update_data(last_user_message_id=message.message_id)
+    log_message(message.from_user.id, message.from_user.username, 'user', message.text, message.chat.id)
+    if is_command(message.text):
+        # Очищати стан лише якщо це /order або /start
+        if message.text == '/order' or message.text == '/start':
+            await state.clear()
+            await order_handler(message, state)
+            return
+        if message.text == '/faq':
+            await faq_handler(message, state)
+        elif message.text == '/cabinet':
+            await cabinet_handler(message, state)
+        elif message.text == '/help':
+            await help_handler(message, state)
+        elif message.text == '/prices':
+            await prices_handler(message, state)
+        return
+    is_valid, error_message = validate_deadline(message.text)
+    if is_valid is None and error_message == COMMAND_INPUT:
+        return False
     data = await state.get_data()
     last_bot_message_id = data.get('last_bot_message_id')
     last_info_id = data.get('last_info_message_id')
+    error_message_id = data.get('error_message_id')
+    if error_message_id:
+        try:
+            await message.bot.delete_message(message.chat.id, error_message_id)
+        except: pass
+        await state.update_data(error_message_id=None)
 
     if message.text == "🔙 Назад":
         if last_info_id:
@@ -364,19 +533,6 @@ async def process_deadline(message: types.Message, state: FSMContext):
         await state.clear()
         return
     
-    is_valid, error_message = validate_deadline(message.text)
-    if not is_valid:
-        if last_info_id:
-            try:
-                await message.bot.delete_message(message.chat.id, last_info_id)
-            except: pass
-        try:
-            await message.delete()
-        except: pass
-        sent = await message.answer(f"⚠️ {error_message}")
-        await state.update_data(last_info_message_id=sent.message_id)
-        return
-
     if last_bot_message_id:
         try:
             await message.bot.delete_message(message.chat.id, last_bot_message_id)
@@ -403,9 +559,45 @@ async def process_deadline(message: types.Message, state: FSMContext):
 
 @router.message(OrderStates.waiting_for_volume)
 async def process_volume(message: types.Message, state: FSMContext):
+    # Видалити повідомлення про спам, якщо воно є
+    data = await state.get_data()
+    last_info_id = data.get('last_info_message_id')
+    if last_info_id:
+        try:
+            await message.bot.delete_message(message.chat.id, last_info_id)
+        except Exception:
+            pass
+        await state.update_data(last_info_message_id=None)
+    await delete_previous_messages(message.bot, message.chat.id, state)
+    await state.update_data(last_user_message_id=message.message_id)
+    log_message(message.from_user.id, message.from_user.username, 'user', message.text, message.chat.id)
+    if is_command(message.text):
+        # Очищати стан лише якщо це /order або /start
+        if message.text == '/order' or message.text == '/start':
+            await state.clear()
+            await order_handler(message, state)
+            return
+        if message.text == '/faq':
+            await faq_handler(message, state)
+        elif message.text == '/cabinet':
+            await cabinet_handler(message, state)
+        elif message.text == '/help':
+            await help_handler(message, state)
+        elif message.text == '/prices':
+            await prices_handler(message, state)
+        return
+    is_valid, error_message = validate_volume(message.text)
+    if is_valid is None and error_message == COMMAND_INPUT:
+        return False
     data = await state.get_data()
     last_bot_message_id = data.get('last_bot_message_id')
     last_info_id = data.get('last_info_message_id')
+    error_message_id = data.get('error_message_id')
+    if error_message_id:
+        try:
+            await message.bot.delete_message(message.chat.id, error_message_id)
+        except: pass
+        await state.update_data(error_message_id=None)
 
     if message.text == "🔙 Назад":
         if last_info_id:
@@ -442,19 +634,6 @@ async def process_volume(message: types.Message, state: FSMContext):
         await state.clear()
         return
     
-    is_valid, error_message = validate_volume(message.text)
-    if not is_valid:
-        if last_info_id:
-            try:
-                await message.bot.delete_message(message.chat.id, last_info_id)
-            except: pass
-        try:
-            await message.delete()
-        except: pass
-        sent = await message.answer(f"⚠️ {error_message}")
-        await state.update_data(last_info_message_id=sent.message_id)
-        return
-
     if last_bot_message_id:
         try:
             await message.bot.delete_message(message.chat.id, last_bot_message_id)
@@ -481,9 +660,45 @@ async def process_volume(message: types.Message, state: FSMContext):
 
 @router.message(OrderStates.waiting_for_requirements)
 async def process_requirements(message: types.Message, state: FSMContext):
+    # Видалити повідомлення про спам, якщо воно є
+    data = await state.get_data()
+    last_info_id = data.get('last_info_message_id')
+    if last_info_id:
+        try:
+            await message.bot.delete_message(message.chat.id, last_info_id)
+        except Exception:
+            pass
+        await state.update_data(last_info_message_id=None)
+    await delete_previous_messages(message.bot, message.chat.id, state)
+    await state.update_data(last_user_message_id=message.message_id)
+    log_message(message.from_user.id, message.from_user.username, 'user', message.text, message.chat.id)
+    if is_command(message.text):
+        # Очищати стан лише якщо це /order або /start
+        if message.text == '/order' or message.text == '/start':
+            await state.clear()
+            await order_handler(message, state)
+            return
+        if message.text == '/faq':
+            await faq_handler(message, state)
+        elif message.text == '/cabinet':
+            await cabinet_handler(message, state)
+        elif message.text == '/help':
+            await help_handler(message, state)
+        elif message.text == '/prices':
+            await prices_handler(message, state)
+        return
+    is_valid, error_message = validate_requirements(message.text)
+    if is_valid is None and error_message == COMMAND_INPUT:
+        return False
     data = await state.get_data()
     last_bot_message_id = data.get('last_bot_message_id')
     last_info_id = data.get('last_info_message_id')
+    error_message_id = data.get('error_message_id')
+    if error_message_id:
+        try:
+            await message.bot.delete_message(message.chat.id, error_message_id)
+        except: pass
+        await state.update_data(error_message_id=None)
 
     if message.text == "🔙 Назад":
         if last_info_id:
@@ -520,19 +735,6 @@ async def process_requirements(message: types.Message, state: FSMContext):
         await state.clear()
         return
     
-    is_valid, error_message = validate_requirements(message.text)
-    if not is_valid:
-        if last_info_id:
-            try:
-                await message.bot.delete_message(message.chat.id, last_info_id)
-            except: pass
-        try:
-            await message.delete()
-        except: pass
-        sent = await message.answer(f"⚠️ {error_message}")
-        await state.update_data(last_info_message_id=sent.message_id)
-        return
-
     if last_bot_message_id:
         try:
             await message.bot.delete_message(message.chat.id, last_bot_message_id)
@@ -561,9 +763,19 @@ async def process_requirements(message: types.Message, state: FSMContext):
 
 @router.message(OrderStates.waiting_for_files)
 async def process_files_choice(message: types.Message, state: FSMContext):
+    # Видалити повідомлення про спам, якщо воно є
+    data = await state.get_data()
+    last_info_id = data.get('last_info_message_id')
+    if last_info_id:
+        try:
+            await message.bot.delete_message(message.chat.id, last_info_id)
+        except Exception:
+            pass
+        await state.update_data(last_info_message_id=None)
+    await delete_previous_messages(message.bot, message.chat.id, state)
     data = await state.get_data()
     last_bot_message_id = data.get('last_bot_message_id')
-    last_info_id = data.get('last_info_message_id')
+    log_message(message.from_user.id, message.from_user.username, 'user', message.text, message.chat.id)
 
     if message.text == "🔙 Назад":
         if last_info_id:
@@ -631,15 +843,15 @@ async def process_files_choice(message: types.Message, state: FSMContext):
 
 @router.message(OrderStates.waiting_for_file_text, F.document | F.photo | F.video)
 async def process_file_upload(message: types.Message, state: FSMContext):
+    await delete_previous_messages(message.bot, message.chat.id, state)
     data = await state.get_data()
-    files = data.get('files', [])
     
     try:
         await message.delete()
     except:
         pass
 
-    if len(files) >= MAX_FILES_PER_ORDER:
+    if len(data.get('files', [])) >= MAX_FILES_PER_ORDER:
         sent = await message.answer(f"⚠️ Максимальна кількість файлів: {MAX_FILES_PER_ORDER}")
         # Store sent message id to delete it later
         temp_messages = data.get('temp_messages', [])
@@ -677,6 +889,7 @@ async def process_file_upload(message: types.Message, state: FSMContext):
         await state.update_data(temp_messages=temp_messages)
         return
     
+    files = data.get('files', [])
     files.append(file_id)
     await state.update_data(files=files)
     
@@ -684,9 +897,28 @@ async def process_file_upload(message: types.Message, state: FSMContext):
     temp_messages = data.get('temp_messages', [])
     temp_messages.append(sent.message_id)
     await state.update_data(temp_messages=temp_messages)
+    # Показати клавіатуру з кнопкою 'Готово' після кожного файлу
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="✅ Готово"), KeyboardButton(text="🔙 Назад")],
+            [KeyboardButton(text="❌ Скасувати")]
+        ],
+        resize_keyboard=True
+    )
+    await message.answer("Якщо файли додані, натисніть 'Готово' або продовжуйте надсилати файли.", reply_markup=keyboard)
 
 @router.message(OrderStates.waiting_for_file_text)
 async def process_file_text(message: types.Message, state: FSMContext):
+    # Видалити повідомлення про спам, якщо воно є
+    data = await state.get_data()
+    last_info_id = data.get('last_info_message_id')
+    if last_info_id:
+        try:
+            await message.bot.delete_message(message.chat.id, last_info_id)
+        except Exception:
+            pass
+        await state.update_data(last_info_message_id=None)
+    await delete_previous_messages(message.bot, message.chat.id, state)
     data = await state.get_data()
     last_bot_message_id = data.get('last_bot_message_id')
     last_info_id = data.get('last_info_message_id')
@@ -806,16 +1038,53 @@ async def go_to_promocode_step(message: types.Message, state: FSMContext):
 
 @router.message(OrderStates.waiting_for_promocode)
 async def process_promocode_input(message: types.Message, state: FSMContext):
+    # Видалити повідомлення про спам, якщо воно є
+    data = await state.get_data()
+    last_info_id = data.get('last_info_message_id')
+    if last_info_id:
+        try:
+            await message.bot.delete_message(message.chat.id, last_info_id)
+        except Exception:
+            pass
+        await state.update_data(last_info_message_id=None)
+    await delete_previous_messages(message.bot, message.chat.id, state)
+    await state.update_data(last_user_message_id=message.message_id)
+    log_message(message.from_user.id, message.from_user.username, 'user', message.text, message.chat.id)
+    if is_command(message.text):
+        # Очищати стан лише якщо це /order або /start
+        if message.text == '/order' or message.text == '/start':
+            await state.clear()
+            await order_handler(message, state)
+            return
+        if message.text == '/faq':
+            await faq_handler(message, state)
+        elif message.text == '/cabinet':
+            await cabinet_handler(message, state)
+        elif message.text == '/help':
+            await help_handler(message, state)
+        elif message.text == '/prices':
+            await prices_handler(message, state)
+        return
+    promocode = message.text.strip().upper()
+    is_valid, error_message = validate_promocode(promocode)
+    if is_valid is None and error_message == COMMAND_INPUT:
+        return False
     data = await state.get_data()
     last_bot_message_id = data.get('last_bot_message_id')
     last_info_id = data.get('last_info_message_id')
+    error_message_id = data.get('error_message_id')
+    if error_message_id:
+        try:
+            await message.bot.delete_message(message.chat.id, error_message_id)
+        except: pass
+        await state.update_data(error_message_id=None)
     bot = message.bot
     chat_id = message.chat.id
-
-    try:
-        await message.delete()
-    except: pass
-
+    promocode = message.text.strip().upper()
+    is_valid, error_message = validate_promocode(promocode)
+    if is_valid is None and error_message == COMMAND_INPUT:
+        return False
+    
     if message.text == "🔙 Назад":
         if last_info_id:
             try:
@@ -873,7 +1142,7 @@ async def process_promocode_input(message: types.Message, state: FSMContext):
                 await bot.delete_message(chat_id, last_info_id)
             except: pass
         prompt_message = await bot.send_message(chat_id, f"⚠️ {error_message}")
-        await state.update_data(last_info_message_id=prompt_message.message_id)
+        await state.update_data(last_info_message_id=prompt_message.message_id, error_message_id=prompt_message.message_id)
         return
 
     promo_data = get_promocode(promocode)
@@ -888,7 +1157,7 @@ async def process_promocode_input(message: types.Message, state: FSMContext):
                 await bot.delete_message(chat_id, last_info_id)
             except: pass
         prompt_message = await bot.send_message(chat_id, "⚠️ Невірний або недійсний промокод. Спробуйте ще раз або натисніть 'Без промокоду'")
-        await state.update_data(last_bot_message_id=prompt_message.message_id)
+        await state.update_data(last_bot_message_id=prompt_message.message_id, error_message_id=prompt_message.message_id)
         return
     
     await state.update_data(promocode=promo_data)
@@ -904,6 +1173,50 @@ async def process_promocode_input(message: types.Message, state: FSMContext):
 async def get_summary_text_and_keyboard(state: FSMContext):
     """Готує текст та клавіатуру для підсумку замовлення."""
     data = await state.get_data()
+    # --- Формула ціни ---
+    order_type = data.get('order_type')
+    price_info = ORDER_TYPE_PRICES.get(order_type, {})
+    base = float(price_info.get('base', 0))
+    volume_str = data.get('volume', '0')
+    volume_match = re.search(r'\d+', volume_str)
+    volume = int(volume_match.group(0)) if volume_match else 0
+    per_unit = 0
+    per_unit_label = ''
+    if 'per_page' in price_info:
+        per_unit = float(price_info['per_page'])
+        per_unit_label = f" + {per_unit} грн/сторінка × {volume}"
+    elif 'per_work' in price_info:
+        per_unit = float(price_info['per_work'])
+        per_unit_label = f" + {per_unit} грн/робота × {volume}"
+    base_plus_units = base + (per_unit * volume)
+    # Множник терміновості
+    deadline_str = data.get('deadline', '')
+    urgency_mult = 1.0
+    urgency_label = ''
+    try:
+        parsed_date = None
+        for fmt in ["%d.%m.%Y", "%d/%m/%Y", "%d-%m-%Y"]:
+            try:
+                parsed_date = datetime.strptime(deadline_str, fmt)
+                break
+            except ValueError:
+                continue
+        if parsed_date:
+            days_to_deadline = (parsed_date - datetime.now()).days
+            if days_to_deadline < 3:
+                urgency_mult = 1.5
+                urgency_label = ' × 1.5 (терміново <3 днів)'
+            elif days_to_deadline < 7:
+                urgency_mult = 1.25
+                urgency_label = ' × 1.25 (терміново <7 днів)'
+    except Exception:
+        pass
+    price_before_discount = base_plus_units * urgency_mult
+    # Знижка
+    discount = float(data.get('discount', 0))
+    discount_label = f" - {discount:.2f} грн (знижка)" if discount else ''
+    formula = f"<b>Формула:</b> {base:.2f} грн (база){per_unit_label}{urgency_label}{discount_label}"
+    # --- Кінець формули ---
     summary = f"""
 📋 <b>Підсумок замовлення:</b>
 
@@ -918,8 +1231,8 @@ async def get_summary_text_and_keyboard(state: FSMContext):
 💰 <b>Вартість:</b> {data.get('price', 0) + data.get('discount', 0):.2f} грн
 🎫 <b>Знижка:</b> {data.get('discount', 0):.2f} грн
 💳 <b>До сплати:</b> {data.get('price', 0):.2f} грн
+{formula}
 """
-    
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="✅ Підтвердити", callback_data="confirm_order")],
@@ -927,11 +1240,12 @@ async def get_summary_text_and_keyboard(state: FSMContext):
             [InlineKeyboardButton(text="❌ Скасувати", callback_data="cancel_order")]
         ]
     )
-    
     text_with_action = f"{summary}\n\nОберіть дію:"
     return text_with_action, keyboard
 
 async def show_order_summary(message: types.Message, state: FSMContext, should_edit: bool = False):
+    await delete_all_tracked_messages(message.bot, message.chat.id, state)
+    await state.update_data(last_user_message_id=message.message_id)
     data = await state.get_data()
     last_info_id = data.get('last_info_message_id')
     last_bot_message_id = data.get('last_bot_message_id')
@@ -966,19 +1280,19 @@ async def show_order_summary(message: types.Message, state: FSMContext, should_e
                 parse_mode="HTML",
                 reply_markup=keyboard
             )
-            await state.update_data(last_info_message_id=sent.message_id)
+            await state.update_data(last_bot_message_id=sent.message_id)
     else:
         sent = await message.answer(
             text_with_action,
             parse_mode="HTML",
             reply_markup=keyboard
         )
-        await state.update_data(last_info_message_id=sent.message_id)
-
+        await state.update_data(last_bot_message_id=sent.message_id)
     await state.set_state(OrderStates.waiting_for_confirmation)
 
 @router.callback_query(OrderStates.waiting_for_confirmation, lambda c: c.data == "confirm_order")
 async def confirm_order_callback(callback: types.CallbackQuery, state: FSMContext):
+    await delete_all_tracked_messages(callback.bot, callback.message.chat.id, state)
     data = await state.get_data()
     
     order_id = add_order(
@@ -1006,13 +1320,14 @@ async def confirm_order_callback(callback: types.CallbackQuery, state: FSMContex
             bonus_amount = data['price'] * Config.REFERRAL_BONUS_PERCENT // 100
             add_referral_bonus(ref[0], callback.from_user.id, order_id, bonus_amount)
     
-    await callback.message.answer(
+    sent = await callback.message.answer(
         f"✅ <b>Замовлення успішно створено!</b>\n\n"
         f"Наш менеджер зв'яжеться з вами найближчим часом.\n"
         f"Для перегляду замовлення використайте /cabinet",
         parse_mode="HTML",
         reply_markup=get_main_menu_keyboard()
     )
+    await state.update_data(last_bot_message_id=sent.message_id)
     await state.clear()
     await callback.answer()
 
@@ -1043,13 +1358,15 @@ async def back_to_summary_callback(callback: types.CallbackQuery, state: FSMCont
 
 @router.callback_query(OrderStates.waiting_for_confirmation, lambda c: c.data == "cancel_order")
 async def cancel_order_callback(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.edit_text("❌ Створення замовлення скасовано.")
-    await callback.message.answer("Оберіть наступну дію:", reply_markup=get_main_menu_keyboard())
+    await delete_all_tracked_messages(callback.bot, callback.message.chat.id, state)
+    sent1 = await callback.message.answer("❌ Створення замовлення скасовано.", reply_markup=get_main_menu_keyboard())
+    sent2 = await callback.message.answer("Оберіть наступну дію:", reply_markup=get_main_menu_keyboard())
+    await state.update_data(last_bot_message_id=[sent1.message_id, sent2.message_id])
     await callback.answer()
 
 @router.callback_query(OrderStates.editing_order, lambda c: c.data.startswith("edit_"))
 async def edit_field_callback(callback: types.CallbackQuery, state: FSMContext):
+    await delete_previous_messages(callback.bot, callback.message.chat.id, state)
     field = callback.data.split("_")[1]
     field_names = {
         "topic": "тему",
@@ -1074,60 +1391,66 @@ async def process_edit_input(message: types.Message, state: FSMContext):
     editing_field = data.get('editing_field')
     last_edit_message_id = data.get('last_edit_message_id')
     last_info_id = data.get('last_info_message_id') # The original summary message
+    error_message_id = data.get('error_message_id')
     bot = message.bot
     chat_id = message.chat.id
-
+    log_message(message.from_user.id, message.from_user.username, 'user', message.text, message.chat.id)
+    if is_command(message.text):
+        # Очищати стан лише якщо це /order або /start
+        if message.text == '/order' or message.text == '/start':
+            await state.clear()
+            await order_handler(message, state)
+            return
+        if message.text == '/faq':
+            await faq_handler(message, state)
+        elif message.text == '/cabinet':
+            await cabinet_handler(message, state)
+        elif message.text == '/help':
+            await help_handler(message, state)
+        elif message.text == '/prices':
+            await prices_handler(message, state)
+        return
     if last_edit_message_id:
         try:
             await bot.delete_message(chat_id, last_edit_message_id)
         except: pass
-    
+    if error_message_id:
+        try:
+            await bot.delete_message(chat_id, error_message_id)
+        except: pass
+        await state.update_data(error_message_id=None)
+
     user_text = message.text
-    try:
-        await message.delete()
-    except:
-        pass
+    if editing_field:
+        validator = {
+            "topic": validate_topic,
+            "subject": validate_subject,
+            "deadline": validate_deadline,
+            "volume": validate_volume,
+            "requirements": validate_requirements
+        }.get(editing_field)
+        if validator:
+            is_valid, error_message = validator(user_text)
+            if is_valid is None and error_message == COMMAND_INPUT:
+                return False
+    if not is_valid:
+        # Delete previous error message if any
+        if data.get('edit_error_id'):
+            try: await bot.delete_message(chat_id, data.get('edit_error_id'))
+            except: pass
 
-    if user_text == "🔙 Назад":
-        # Since we deleted the original summary, we must send a new one
-        await show_order_summary(message, state) # `message` is deleted but obj can be used for context
+        sent_error = await bot.send_message(chat_id, f"⚠️ {error_message}")
+        
+        # Resend prompt
+        field_names = {
+            "topic": "тему", "subject": "предмет", "deadline": "термін",
+            "volume": "обсяг", "requirements": "вимоги"
+        }
+        keyboard = get_back_keyboard()
+        prompt = await bot.send_message(chat_id, f"Введіть новий {field_names.get(editing_field, 'параметр')}:", reply_markup=keyboard)
+        
+        await state.update_data(last_edit_message_id=prompt.message_id, edit_error_id=sent_error.message_id, error_message_id=sent_error.message_id)
         return
-    
-    if user_text == "❌ Скасувати":
-        await state.clear()
-        await bot.send_message(chat_id, "Редагування скасовано.", reply_markup=get_main_menu_keyboard())
-        return
-    
-    # Validator function mapping
-    validation_functions = {
-        "topic": validate_topic,
-        "subject": validate_subject,
-        "deadline": validate_deadline,
-        "volume": validate_volume,
-        "requirements": validate_requirements
-    }
-
-    validator = validation_functions.get(editing_field)
-    if validator:
-        is_valid, error_message = validator(user_text)
-        if not is_valid:
-            # Delete previous error message if any
-            if data.get('edit_error_id'):
-                try: await bot.delete_message(chat_id, data.get('edit_error_id'))
-                except: pass
-
-            sent_error = await bot.send_message(chat_id, f"⚠️ {error_message}")
-            
-            # Resend prompt
-            field_names = {
-                "topic": "тему", "subject": "предмет", "deadline": "термін",
-                "volume": "обсяг", "requirements": "вимоги"
-            }
-            keyboard = get_back_keyboard()
-            prompt = await bot.send_message(chat_id, f"Введіть новий {field_names.get(editing_field, 'параметр')}:", reply_markup=keyboard)
-            
-            await state.update_data(last_edit_message_id=prompt.message_id, edit_error_id=sent_error.message_id)
-            return
 
     await state.update_data(**{editing_field: user_text})
     

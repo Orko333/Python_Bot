@@ -5,7 +5,8 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from app.config import Config
-from app.db import add_feedback, get_feedbacks
+from app.db import add_feedback, get_feedbacks, log_message
+from app.utils.validation import delete_previous_messages, delete_all_tracked_messages, is_command
 
 router = Router()
 FEEDBACK_FILE = "feedback.json"
@@ -29,34 +30,39 @@ class FeedbackStates(StatesGroup):
 # Команда для користувача
 @router.message(Command("feedback"))
 async def feedback_start(message: types.Message, state: FSMContext):
+    await delete_all_tracked_messages(message.bot, message.chat.id, state)
+    await state.update_data(last_user_message_id=message.message_id)
     user_id = message.from_user.id
     try:
-        await message.delete()
-        data = await state.get_data()
-        last_info_id = data.get('last_info_message_id')
-        if last_info_id:
-            try:
-                await message.bot.delete_message(message.chat.id, last_info_id)
-            except: pass
-        prompt_message = await message.answer("Залиште, будь ласка, свій відгук про виконане замовлення. Ви можете написати текст і/або оцінку від 1 до 5 зірок (наприклад: 5 ⭐️)")
-        await state.update_data(last_info_message_id=prompt_message.message_id)
+        # Якщо є message.delete(), обгорнути у try/except
+        # (у feedback_start його немає, але додати для майбутніх змін)
+        try:
+            await message.delete()
+        except Exception as del_exc:
+            print(f"[WARNING] /feedback: не вдалося видалити повідомлення: {del_exc}")
+        sent = await message.answer("Залиште, будь ласка, свій відгук про виконане замовлення. Ви можете написати текст і/або оцінку від 1 до 5 зірок (наприклад: 5 ⭐️)")
+        await state.update_data(last_bot_message_id=sent.message_id)
+        log_message(user_id, message.from_user.username, 'user', message.text, message.chat.id)
         print(f"[INFO] /feedback: user {user_id} - feedback request sent")
     except Exception as e:
         print(f"[ERROR] /feedback: user {user_id} - {e}")
         sent = await message.answer("Сталася помилка при запиті на відгук.")
-        await state.update_data(last_info_message_id=sent.message_id)
+        await state.update_data(last_bot_message_id=sent.message_id)
 
 @router.message(FeedbackStates.waiting_for_feedback)
 async def process_feedback(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    last_info_id = data.get('last_info_message_id')
-    if last_info_id:
-        try:
-            await message.bot.delete_message(message.chat.id, last_info_id)
-        except: pass
+    await delete_all_tracked_messages(message.bot, message.chat.id, state)
+    await state.update_data(last_user_message_id=message.message_id)
+    log_message(message.from_user.id, message.from_user.username, 'user', message.text, message.chat.id)
+    if is_command(message.text):
+        return False
     try:
-        await message.delete()
-    except: pass
+        sent = await message.answer("Дякуємо за ваш відгук!")
+        await state.update_data(last_bot_message_id=sent.message_id)
+        await state.clear()
+    except Exception as e:
+        sent = await message.answer("Сталася помилка при надсиланні відгуку.")
+        await state.update_data(last_bot_message_id=sent.message_id)
         
     feedback = {
         "user_id": message.from_user.id,

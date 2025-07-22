@@ -5,7 +5,8 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from app.config import Config
-from app.db import add_support_log
+from app.db import add_support_log, log_message
+from app.utils.validation import delete_previous_messages, delete_all_tracked_messages, is_command
 
 router = Router()
 SUPPORT_LOG = "support_log.json"
@@ -26,55 +27,38 @@ class SupportStates(StatesGroup):
 # Користувач ініціює підтримку
 @router.message(Command("support"))
 async def support_start(message: types.Message, state: FSMContext):
+    await delete_all_tracked_messages(message.bot, message.chat.id, state)
+    await state.update_data(last_user_message_id=message.message_id)
     user_id = message.from_user.id
     try:
-        await message.delete()
-        data = await state.get_data()
-        last_info_id = data.get('last_info_message_id')
-        if last_info_id:
-            try:
-                await message.bot.delete_message(message.chat.id, last_info_id)
-            except: pass
-        prompt_message = await message.answer(
-            "Напишіть своє питання або уточнення. Менеджер отримає ваше повідомлення і відповість тут у чаті."
-        )
-        await state.update_data(last_info_message_id=prompt_message.message_id)
+        try:
+            await message.delete()
+        except Exception as del_exc:
+            print(f"[WARNING] /support: не вдалося видалити повідомлення: {del_exc}")
+        sent = await message.answer("Напишіть своє питання або уточнення. Менеджер отримає ваше повідомлення і відповість тут у чаті.")
+        await state.update_data(last_bot_message_id=sent.message_id)
+        log_message(message.from_user.id, message.from_user.username, 'user', message.text, message.chat.id)
         print(f"[INFO] /support: user {user_id} - support started")
     except Exception as e:
         print(f"[ERROR] /support: user {user_id} - {e}")
         sent = await message.answer("Сталася помилка при зверненні до підтримки.")
-        await state.update_data(last_info_message_id=sent.message_id)
+        await state.update_data(last_bot_message_id=sent.message_id)
 
 # Пересилка повідомлення користувача адміну
 @router.message(SupportStates.waiting_for_message)
 async def support_user_message(message: types.Message, state: FSMContext, bot: Bot):
-    data = await state.get_data()
-    last_bot_message_id = data.get('last_bot_message_id')
-    last_info_id = data.get('last_info_message_id')
-
-    if last_bot_message_id:
-        try:
-            await message.bot.delete_message(message.chat.id, last_bot_message_id)
-        except: pass
-    if last_info_id:
-        try:
-            await message.bot.delete_message(message.chat.id, last_info_id)
-        except: pass
+    await delete_all_tracked_messages(message.bot, message.chat.id, state)
+    await state.update_data(last_user_message_id=message.message_id)
+    if is_command(message.text):
+        return False
     try:
-        await message.delete()
-    except: pass
-        
-    for admin_id in Config.ADMIN_IDS:
-        await bot.send_message(
-            admin_id,
-            f"<b>Питання від користувача</b> <code>{message.from_user.id}</code> (@{message.from_user.username})\n\n"
-            f"{message.text}",
-            parse_mode="HTML"
-        )
-    
-    confirmation_message = await message.answer("Ваше питання надіслано менеджеру. Очікуйте відповідь тут у чаті. Наступні повідомлення також будуть пересилатись.")
-    await state.set_state(SupportStates.in_dialog)
-    await state.update_data(last_info_message_id=confirmation_message.message_id)
+        sent = await message.answer("Ваше питання надіслано менеджеру. Очікуйте відповідь тут у чаті. Наступні повідомлення також будуть пересилатись.")
+        await state.update_data(last_bot_message_id=sent.message_id)
+        await state.set_state(SupportStates.in_dialog)
+        log_message(message.from_user.id, message.from_user.username, 'user', message.text, message.chat.id)
+    except Exception as e:
+        sent = await message.answer("Сталася помилка при надсиланні питання.")
+        await state.update_data(last_bot_message_id=sent.message_id)
 
 @router.message(SupportStates.in_dialog, ~F.text.startswith('/'))
 async def support_dialog_message(message: types.Message, bot: Bot):
@@ -86,6 +70,7 @@ async def support_dialog_message(message: types.Message, bot: Bot):
         )
     await message.answer("Повідомлення надіслано.", reply_markup=types.ReplyKeyboardRemove())
     # Немає потреби видаляти, діалог триває
+    log_message(message.from_user.id, message.from_user.username, 'user', message.text, message.chat.id)
 
 # Адмін відповідає користувачу через reply
 @router.message(F.reply_to_message, F.from_user.id.in_(Config.ADMIN_IDS))
@@ -108,4 +93,5 @@ async def support_admin_reply(message: types.Message, bot: Bot):
         except (ValueError, IndexError):
             await message.answer("⚠️ Не вдалося визначити користувача для відповіді.")
     else:
-        await message.answer("⚠️ Не вдалося визначити користувача. Відповідайте на правильне повідомлення.") 
+        await message.answer("⚠️ Не вдалося визначити користувача. Відповідайте на правильне повідомлення.")
+    log_message(message.from_user.id, message.from_user.username, 'user', message.text, message.chat.id) 

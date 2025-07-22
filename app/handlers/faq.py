@@ -1,8 +1,10 @@
-from aiogram import types, Router
+from aiogram import types, Router, F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import logging
 from aiogram.fsm.context import FSMContext
+from app.utils.validation import delete_previous_messages, delete_all_tracked_messages, is_command
+from app.db import log_message
 
 # Налаштування логування
 logging.basicConfig(level=logging.INFO)
@@ -43,25 +45,55 @@ def get_faq_keyboard():
 
 @router.message(Command("faq"))
 async def faq_handler(message: types.Message, state: FSMContext):
+    await delete_all_tracked_messages(message.bot, message.chat.id, state)
+    await state.update_data(last_user_message_id=message.message_id)
     user_id = message.from_user.id
     try:
-        await message.delete()
-        data = await state.get_data()
-        last_info_id = data.get('last_info_message_id')
-        if last_info_id:
-            try:
-                await message.bot.delete_message(message.chat.id, last_info_id)
-            except: pass
-        keyboard = get_faq_keyboard()
-        sent = await message.answer("Часті запитання:", reply_markup=keyboard)
-        await state.update_data(last_info_message_id=sent.message_id)
+        # Якщо є message.delete(), обгорнути у try/except
+        # (у faq_handler його немає, але додати для майбутніх змін)
+        try:
+            await message.delete()
+        except Exception as del_exc:
+            print(f"[WARNING] /faq: не вдалося видалити повідомлення: {del_exc}")
+        sent = await message.answer("Часті запитання:", reply_markup=get_faq_keyboard())
+        await state.update_data(last_bot_message_id=sent.message_id)
         print(f"[INFO] /faq: user {user_id} - faq sent")
+        log_message(user_id, message.from_user.username, 'user', message.text, message.chat.id)
     except Exception as e:
         print(f"[ERROR] /faq: user {user_id} - {e}")
-        await message.answer("Вибачте, сталася помилка. Спробуйте пізніше.")
+        sent = await message.answer("Вибачте, сталася помилка. Спробуйте пізніше.")
+        await state.update_data(last_bot_message_id=sent.message_id)
+
+@router.callback_query(F.data == 'faq:back')
+async def faq_back_callback(callback: types.CallbackQuery, state: FSMContext):
+    try:
+        # Видалити всі попередні повідомлення, включаючи last_info_message_id
+        await delete_all_tracked_messages(callback.bot, callback.message.chat.id, state, keys=["last_bot_message_id", "last_user_message_id", "last_info_message_id"])
+        keyboard = get_faq_keyboard()
+        chat_id = callback.message.chat.id
+        user_id = callback.from_user.id
+        logger.info(f"[FAQ BACK] chat_id={chat_id}, user_id={user_id}, callback.data={callback.data}")
+        # Додатково очищаємо last_info_message_id у state
+        await state.update_data(last_info_message_id=None)
+        sent = await callback.bot.send_message(chat_id, "Часті запитання:", reply_markup=keyboard, parse_mode="HTML")
+        logger.info(f"[FAQ BACK] Sent new FAQ message after back, message_id={sent.message_id}")
+        await state.update_data(last_info_message_id=sent.message_id)
+        await callback.answer()
+        log_message(user_id, callback.from_user.username, 'user', callback.data, callback.message.chat.id)
+    except Exception as e:
+        logger.error(f"Error in FAQ back callback: {str(e)}")
+        await callback.bot.send_message(callback.message.chat.id, f"Вибачте, сталася помилка. {e}")
 
 @router.callback_query(lambda c: c.data and c.data.startswith('faq:'))
 async def faq_callback_handler(callback: types.CallbackQuery, state: FSMContext):
+    # Видалити всі попередні повідомлення, включаючи last_info_message_id
+    await delete_all_tracked_messages(callback.bot, callback.message.chat.id, state, keys=["last_bot_message_id", "last_user_message_id", "last_info_message_id"])
+    # Додатково очищаємо last_info_message_id у state
+    await state.update_data(last_info_message_id=None)
+    # callback.data не може бути командою, але для уніфікації можна додати перевірку
+    if is_command(getattr(callback, 'data', '')):
+        await state.clear()
+        return
     logger.info(f"FAQ callback handler called with data: {callback.data}")
     try:
         key = callback.data.split(":")[1]
@@ -69,21 +101,12 @@ async def faq_callback_handler(callback: types.CallbackQuery, state: FSMContext)
             answer = FAQ_DATA[key]["answer"]
             back_button = InlineKeyboardButton(text="⬅️ Назад до питань", callback_data="faq:back")
             keyboard = InlineKeyboardMarkup(inline_keyboard=[[back_button]])
-            await callback.message.edit_text(answer, parse_mode="HTML", reply_markup=keyboard)
-            await state.update_data(last_info_message_id=callback.message.message_id)
+            sent = await callback.message.answer(answer, parse_mode="HTML", reply_markup=keyboard)
+            await state.update_data(last_bot_message_id=sent.message_id)
             logger.info(f"FAQ answer sent for key: {key}")
+            log_message(callback.from_user.id, callback.from_user.username, 'user', callback.data, callback.message.chat.id)
         await callback.answer()
     except Exception as e:
         logger.error(f"Error in FAQ callback handler: {str(e)}")
-        await callback.message.answer("Вибачте, сталася помилка. Спробуйте пізніше.")
-
-@router.callback_query(lambda c: c.data and c.data == 'faq:back')
-async def faq_back_callback(callback: types.CallbackQuery, state: FSMContext):
-    try:
-        keyboard = get_faq_keyboard()
-        await callback.message.edit_text("Часті запитання:", reply_markup=keyboard)
-        await state.update_data(last_info_message_id=callback.message.message_id)
-        await callback.answer()
-    except Exception as e:
-        logger.error(f"Error in FAQ back callback: {str(e)}")
-        await callback.message.answer("Вибачте, сталася помилка.") 
+        sent = await callback.message.answer("Вибачте, сталася помилка. Спробуйте пізніше.")
+        await state.update_data(last_bot_message_id=sent.message_id) 

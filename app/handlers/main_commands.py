@@ -4,6 +4,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
 from .start import ORDER_TYPES # Assuming ORDER_TYPES is in start.py
 from magic_filter import F
+from app.utils.validation import delete_all_tracked_messages
 
 router = Router()
 
@@ -22,20 +23,23 @@ async def setup_bot_commands(bot: Bot):
 
 @router.message(Command("order"))
 async def order_handler(message: types.Message, state: FSMContext):
+    await delete_all_tracked_messages(message.bot, message.chat.id, state)
+    await state.update_data(last_user_message_id=message.message_id)
     user_id = message.from_user.id
     try:
-        await state.clear()
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text=name, callback_data=f"order_type:{code}")]
                 for name, code in ORDER_TYPES
             ]
         )
-        await message.answer("Оберіть тип роботи:", reply_markup=keyboard)
+        sent = await message.answer("Оберіть тип роботи:", reply_markup=keyboard)
+        await state.update_data(last_bot_message_id=sent.message_id)
         print(f"[INFO] /order: user {user_id} - order menu sent")
     except Exception as e:
         print(f"[ERROR] /order: user {user_id} - {e}")
-        await message.answer("Сталася помилка при створенні замовлення.")
+        sent = await message.answer("Сталася помилка при створенні замовлення.")
+        await state.update_data(last_bot_message_id=sent.message_id)
 
 @router.message(F.text == "📝 Нове замовлення")
 async def order_button_handler(message: types.Message, state: FSMContext):
@@ -44,5 +48,7 @@ async def order_button_handler(message: types.Message, state: FSMContext):
 
 @router.message(F.text == "👤 Мій кабінет")
 async def cabinet_button_handler(message: types.Message, state: FSMContext):
+    await delete_all_tracked_messages(message.bot, message.chat.id, state)
+    await state.update_data(last_user_message_id=message.message_id)
     from app.handlers.cabinet import cabinet_handler
     await cabinet_handler(message, state) 

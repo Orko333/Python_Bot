@@ -39,7 +39,7 @@ def test_validate_deadline():
 
     future = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
     past = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    too_far = (datetime.now() + timedelta(days=400)).strftime("%Y-%m-%d")
+    too_far = (datetime.now() + timedelta(days=800)).strftime("%Y-%m-%d")  # >2 роки
 
     # Валідні дедлайни
     assert validate_deadline(future)[0] is True
@@ -61,7 +61,7 @@ def test_validate_volume():
     assert validate_volume("")[0] is False  # Порожній
     assert validate_volume("zero")[0] is False  # Без чисел
     assert validate_volume("0")[0] is False  # Нуль
-    assert validate_volume("1001")[0] is False  # Завеликий
+    assert validate_volume("5001")[0] is False  # Завеликий
 
 def test_validate_topic():
     """Тест валідації теми"""

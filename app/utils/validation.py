@@ -1,6 +1,15 @@
 import re
 from datetime import datetime, timedelta
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
+
+from aiogram import Bot
+from aiogram.fsm.context import FSMContext
+import logging
+
+def is_command(text: str) -> bool:
+    return isinstance(text, str) and text.strip().startswith("/")
+
+COMMAND_INPUT = "COMMAND_INPUT"
 
 def validate_phone(phone: str) -> Tuple[bool, str]:
     """Валідує номер телефону для України"""
@@ -35,6 +44,9 @@ def validate_deadline(deadline: str) -> Tuple[bool, str]:
     if not deadline:
         return False, "Дедлайн не може бути порожнім"
     
+    if is_command(deadline):
+        return None, COMMAND_INPUT
+
     # Спробуємо різні формати дат
     formats = [
         "%d.%m.%Y", "%d/%m/%Y", "%d-%m-%Y",
@@ -50,12 +62,12 @@ def validate_deadline(deadline: str) -> Tuple[bool, str]:
             continue
             
     if parsed_date is None:
-        return False, "Невірний формат дати. Використовуйте формат ДД.ММ.РРРР, наприклад: 25.12.2024"
+        return False, "Невірний формат дати. Використовуйте формат ДД.ММ.РРРР, наприклад: 10.10.2010"
 
     if parsed_date.date() < datetime.now().date():
-        return False, "Дедлайн не може бути в минулому"
+        return False, "Дедлайн не може бути в минулому Повторіть ввід у форматі ДД.ММ.РРРР"
     if parsed_date.date() > datetime.now().date() + timedelta(days=365*2): # Дозволимо до 2-х років
-        return False, "Дедлайн не може бути більше двох років вперед"
+        return False, "Дедлайн не може бути більше двох років вперед Повторіть ввід у форматі ДД.ММ.РРРР"
         
     return True, "OK"
 
@@ -64,6 +76,9 @@ def validate_volume(volume: str) -> Tuple[bool, str]:
     if not volume:
         return False, "Обсяг не може бути порожнім"
     
+    if is_command(volume):
+        return None, COMMAND_INPUT
+
     # Шукаємо числа в тексті
     numbers = re.findall(r'\d+', volume)
     if not numbers:
@@ -84,6 +99,9 @@ def validate_topic(topic: str) -> Tuple[bool, str]:
     if not topic:
         return False, "Тема не може бути порожньою"
     
+    if is_command(topic):
+        return None, COMMAND_INPUT
+
     if len(topic) < 3:
         return False, "Тема занадто коротка (мінімум 3 символи)"
     
@@ -97,6 +115,9 @@ def validate_subject(subject: str) -> Tuple[bool, str]:
     if not subject:
         return False, "Предмет не може бути порожнім"
     
+    if is_command(subject):
+        return None, COMMAND_INPUT
+
     if len(subject) < 2:
         return False, "Предмет занадто короткий (мінімум 2 символи)"
     
@@ -110,6 +131,9 @@ def validate_requirements(requirements: str) -> Tuple[bool, str]:
     if not requirements:
         return True, "OK"  # Вимоги можуть бути порожніми
     
+    if is_command(requirements):
+        return None, COMMAND_INPUT
+
     if len(requirements) > 2000:
         return False, "Вимоги занадто довгі (максимум 2000 символів)"
     
@@ -120,6 +144,9 @@ def validate_promocode(code: str) -> Tuple[bool, str]:
     if not code:
         return True, "OK"  # Промокод може бути порожнім
     
+    if is_command(code):
+        return None, COMMAND_INPUT
+
     if len(code) < 3:
         return False, "Промокод занадто короткий"
     
@@ -168,3 +195,57 @@ def validate_file_type(mime_type: str, allowed_types: list = None) -> Tuple[bool
         return False, f"Непідтримуваний тип файлу: {mime_type}"
     
     return True, "OK" 
+
+async def delete_previous_messages(bot: Bot, chat_id: int, state: FSMContext, keys: List[str] = None):
+    """
+    Видаляє всі попередні повідомлення (бота і користувача) для поточного чату.
+    За замовчуванням шукає ключі last_bot_message_id, last_user_message_id, last_message_ids у state.
+    """
+    data = await state.get_data()
+    if keys is None:
+        keys = ["last_bot_message_id", "last_user_message_id", "last_message_ids"]
+    message_ids = set()
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, list):
+            message_ids.update(value)
+        elif isinstance(value, int):
+            message_ids.add(value)
+        elif isinstance(value, str):
+            try:
+                message_ids.add(int(value))
+            except Exception:
+                pass
+    for message_id in message_ids:
+        try:
+            await bot.delete_message(chat_id, message_id)
+        except Exception:
+            pass  # Ігноруємо помилки (наприклад, якщо вже видалено) 
+
+async def delete_all_tracked_messages(bot: Bot, chat_id: int, state: FSMContext, keys: list = None):
+    """
+    Видаляє останнє повідомлення бота (last_bot_message_id) і користувача (last_user_message_id) для максимально чистого чату.
+    """
+    data = await state.get_data()
+    if keys is None:
+        keys = ["last_bot_message_id", "last_user_message_id"]
+    message_ids = set()
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, list):
+            message_ids.update(value)
+        elif isinstance(value, int):
+            message_ids.add(value)
+        elif isinstance(value, str):
+            try:
+                message_ids.add(int(value))
+            except Exception:
+                pass
+    for message_id in message_ids:
+        try:
+            await bot.delete_message(chat_id, message_id)
+            print(f"[delete_all_tracked_messages] Видалено повідомлення {message_id}")
+        except Exception as e:
+            print(f"[delete_all_tracked_messages] Не вдалося видалити {message_id}: {e}")
+    # Очищаємо ключі у state
+    await state.update_data(last_bot_message_id=None, last_user_message_id=None) 

@@ -38,15 +38,17 @@ async def main():
         logger.info("Команди бота налаштовані")
         
         # Реєструємо роутери в порядку пріоритету
+        # Спочатку FSM-роутери
+        dp.include_router(order_router)
+        dp.include_router(feedback_router)
+        dp.include_router(support_router)
+        # Потім командні роутери
         dp.include_router(main_commands_router)
         dp.include_router(start_router)
         dp.include_router(help_router)
         dp.include_router(faq_router)
         dp.include_router(prices_router)
-        dp.include_router(order_router)
         dp.include_router(cabinet_router)
-        dp.include_router(support_router)
-        dp.include_router(feedback_router)
         dp.include_router(broadcast_router)
         
         logger.info("Всі роутери зареєстровані")

@@ -10,13 +10,14 @@ from datetime import datetime, timedelta
 from app.db import (
     get_orders, get_order_by_num, find_orders, update_order_status, 
     add_promocode, get_promocode, get_promocode_usages, get_order_by_id,
-    create_backup, check_spam_protection
+    create_backup, check_spam_protection, log_message
 )
 import re
 from aiogram.filters.command import CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from app.utils.validation import delete_previous_messages, delete_all_tracked_messages, is_command
 
 router = Router()
 
@@ -37,15 +38,20 @@ def get_admin_keyboard():
 
 @router.message(Command("cabinet"))
 async def cabinet_handler(message: types.Message, state: FSMContext):
+    await delete_all_tracked_messages(message.bot, message.chat.id, state)
+    await state.update_data(last_user_message_id=message.message_id)
     user_id = message.from_user.id
     try:
-        await message.delete()
         data = await state.get_data()
         last_info_id = data.get('last_info_message_id')
         if last_info_id:
             try:
                 await message.bot.delete_message(message.chat.id, last_info_id)
             except: pass
+        try:
+            await message.delete()
+        except Exception as del_exc:
+            print(f"[WARNING] /cabinet: не вдалося видалити повідомлення: {del_exc}")
         if user_id in Config.ADMIN_IDS:
             print(f"[INFO] /cabinet: admin {user_id} - перенаправлено на /cabinet_ad")
             sent = await message.answer("❗️ Для адміністратора використовуйте /cabinet_ad", parse_mode="HTML")
@@ -75,33 +81,32 @@ async def cabinet_handler(message: types.Message, state: FSMContext):
         if len(orders) > 10:
             text += f"... та ще {len(orders) - 10} замовлень"
         sent = await message.answer(text, parse_mode="HTML", reply_markup=None)
-        await state.update_data(last_info_message_id=sent.message_id)
+        await state.update_data(last_bot_message_id=sent.message_id)
         print(f"[INFO] /cabinet: user {user_id} - показано {len(orders)} замовлень")
     except Exception as e:
         print(f"[ERROR] /cabinet: user {user_id} - {e}")
         sent = await message.answer("Сталася помилка при отриманні кабінету.")
-        await state.update_data(last_info_message_id=sent.message_id)
+        await state.update_data(last_bot_message_id=sent.message_id)
 
 @router.message(Command("cabinet_ad"))
 async def cabinet_admin_handler(message: types.Message):
     user_id = message.from_user.id
     try:
         await message.delete()
-        if user_id not in Config.ADMIN_IDS:
-            print(f"[ERROR] /cabinet_ad: user {user_id} не є адміністратором")
-            await message.answer("⛔️ Доступ лише для адміністратора", parse_mode="HTML")
-            return
-        keyboard = get_admin_keyboard()
-        await message.answer(
-            "🔧 <b>Адміністративний кабінет</b>\n\n"
-            "Оберіть потрібну функцію:",
-            parse_mode="HTML",
-            reply_markup=keyboard
-        )
-        print(f"[INFO] /cabinet_ad: admin {user_id} - відкрито адмін-кабінет")
-    except Exception as e:
-        print(f"[ERROR] /cabinet_ad: user {user_id} - {e}")
-        await message.answer("Сталася помилка при відкритті адмін-кабінету.")
+    except Exception as del_exc:
+        print(f"[WARNING] /cabinet_ad: не вдалося видалити повідомлення: {del_exc}")
+    if user_id not in Config.ADMIN_IDS:
+        print(f"[ERROR] /cabinet_ad: user {user_id} не є адміністратором")
+        await message.answer("⛔️ Доступ лише для адміністратора", parse_mode="HTML")
+        return
+    keyboard = get_admin_keyboard()
+    await message.answer(
+        "🔧 <b>Адміністративний кабінет</b>\n\n"
+        "Оберіть потрібну функцію:",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+    print(f"[INFO] /cabinet_ad: admin {user_id} - відкрито адмін-кабінет")
 
 @router.callback_query(lambda c: c.data == "admin_stats")
 async def admin_stats_callback(callback: types.CallbackQuery):
@@ -377,7 +382,10 @@ async def back_to_admin_callback(callback: types.CallbackQuery):
 async def orders_handler(message: types.Message, state: FSMContext):
     if message.from_user.id not in Config.ADMIN_IDS:
         return
-    await message.delete()
+    try:
+        await message.delete()
+    except Exception as del_exc:
+        print(f"[WARNING] /orders: не вдалося видалити повідомлення: {del_exc}")
     data = await state.get_data()
     last_info_id = data.get('last_info_message_id')
     if last_info_id:
@@ -414,7 +422,10 @@ async def orders_handler(message: types.Message, state: FSMContext):
 async def order_detail_handler(message: types.Message, command: CommandObject, state: FSMContext):
     if message.from_user.id not in Config.ADMIN_IDS:
         return
-    await message.delete()
+    try:
+        await message.delete()
+    except Exception as del_exc:
+        print(f"[WARNING] /order: не вдалося видалити повідомлення: {del_exc}")
     data = await state.get_data()
     last_info_id = data.get('last_info_message_id')
     if last_info_id:
@@ -496,7 +507,10 @@ async def order_detail_handler(message: types.Message, command: CommandObject, s
 async def set_status_handler(message: types.Message, command: CommandObject, state: FSMContext):
     if message.from_user.id not in Config.ADMIN_IDS:
         return
-    await message.delete()
+    try:
+        await message.delete()
+    except Exception as del_exc:
+        print(f"[WARNING] /setstatus: не вдалося видалити повідомлення: {del_exc}")
     data = await state.get_data()
     last_info_id = data.get('last_info_message_id')
     if last_info_id:
@@ -531,7 +545,10 @@ async def set_status_handler(message: types.Message, command: CommandObject, sta
 async def stats_handler(message: types.Message, state: FSMContext):
     if message.from_user.id not in Config.ADMIN_IDS:
         return
-    await message.delete()
+    try:
+        await message.delete()
+    except Exception as del_exc:
+        print(f"[WARNING] /stats: не вдалося видалити повідомлення: {del_exc}")
     data = await state.get_data()
     last_info_id = data.get('last_info_message_id')
     if last_info_id:
@@ -580,7 +597,10 @@ async def stats_handler(message: types.Message, state: FSMContext):
 async def add_promo_handler(message: types.Message, command: CommandObject, state: FSMContext):
     if message.from_user.id not in Config.ADMIN_IDS:
         return
-    await message.delete()
+    try:
+        await message.delete()
+    except Exception as del_exc:
+        print(f"[WARNING] /addpromo: не вдалося видалити повідомлення: {del_exc}")
     data = await state.get_data()
     last_info_id = data.get('last_info_message_id')
     if last_info_id:
@@ -613,7 +633,10 @@ async def add_promo_handler(message: types.Message, command: CommandObject, stat
 async def promos_handler(message: types.Message, state: FSMContext):
     if message.from_user.id not in Config.ADMIN_IDS:
         return
-    await message.delete()
+    try:
+        await message.delete()
+    except Exception as del_exc:
+        print(f"[WARNING] /promos: не вдалося видалити повідомлення: {del_exc}")
     data = await state.get_data()
     last_info_id = data.get('last_info_message_id')
     if last_info_id:
@@ -655,7 +678,10 @@ async def promos_handler(message: types.Message, state: FSMContext):
 async def feedbacks_handler(message: types.Message, state: FSMContext):
     if message.from_user.id not in Config.ADMIN_IDS:
         return
-    await message.delete()
+    try:
+        await message.delete()
+    except Exception as del_exc:
+        print(f"[WARNING] /feedbacks: не вдалося видалити повідомлення: {del_exc}")
     data = await state.get_data()
     last_info_id = data.get('last_info_message_id')
     if last_info_id:

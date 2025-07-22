@@ -4,6 +4,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from app.config import Config
 from app.db import get_orders # We use get_orders to get all users who ever ordered
+from app.utils.validation import delete_previous_messages, delete_all_tracked_messages
 
 router = Router()
 
@@ -13,22 +14,30 @@ class BroadcastStates(StatesGroup):
 
 @router.message(Command("broadcast"))
 async def broadcast_start_handler(message: types.Message, state: FSMContext):
+    await delete_all_tracked_messages(message.bot, message.chat.id, state)
+    await state.update_data(last_user_message_id=message.message_id)
     user_id = message.from_user.id
     try:
         if user_id not in Config.ADMIN_IDS:
             print(f"[ERROR] /broadcast: user {user_id} - not admin")
             return
-        await message.delete()
-        prompt_message = await message.answer("Введіть текст повідомлення для розсилки:")
-        await state.update_data(last_bot_message_id=prompt_message.message_id)
+        try:
+            await message.delete()
+        except Exception as del_exc:
+            print(f"[WARNING] /broadcast: не вдалося видалити повідомлення: {del_exc}")
+        sent = await message.answer("Введіть текст повідомлення для розсилки:")
+        await state.update_data(last_bot_message_id=sent.message_id)
         await state.set_state(BroadcastStates.waiting_for_message)
         print(f"[INFO] /broadcast: admin {user_id} - started broadcast")
     except Exception as e:
         print(f"[ERROR] /broadcast: user {user_id} - {e}")
-        await message.answer("Сталася помилка при старті розсилки.")
+        sent = await message.answer("Сталася помилка при старті розсилки.")
+        await state.update_data(last_bot_message_id=sent.message_id)
 
 @router.message(BroadcastStates.waiting_for_message)
 async def broadcast_message_handler(message: types.Message, state: FSMContext):
+    await delete_all_tracked_messages(message.bot, message.chat.id, state)
+    await state.update_data(last_user_message_id=message.message_id)
     data = await state.get_data()
     last_bot_message_id = data.get('last_bot_message_id')
     
@@ -47,16 +56,18 @@ async def broadcast_message_handler(message: types.Message, state: FSMContext):
     
     await state.update_data(user_ids_to_send=list(user_ids))
     
-    prompt_message = await message.answer(
+    sent = await message.answer(
         f"Повідомлення для розсилки:\n\n---\n{message.text}\n---\n\n"
         f"Знайдено {len(user_ids)} унікальних користувачів для розсилки. "
         f"Надіслати? (так/ні)",
     )
-    await state.update_data(last_bot_message_id=prompt_message.message_id)
+    await state.update_data(last_bot_message_id=sent.message_id)
     await state.set_state(BroadcastStates.waiting_for_confirmation)
 
 @router.message(BroadcastStates.waiting_for_confirmation)
 async def broadcast_confirmation_handler(message: types.Message, state: FSMContext):
+    await delete_all_tracked_messages(message.bot, message.chat.id, state)
+    await state.update_data(last_user_message_id=message.message_id)
     data = await state.get_data()
     last_bot_message_id = data.get('last_bot_message_id')
     
@@ -69,7 +80,8 @@ async def broadcast_confirmation_handler(message: types.Message, state: FSMConte
     except: pass
 
     if message.text.lower() not in ["так", "yes"]:
-        await message.answer("Розсилку скасовано.")
+        sent = await message.answer("Розсилку скасовано.")
+        await state.update_data(last_bot_message_id=sent.message_id)
         await state.clear()
         return
 
@@ -77,11 +89,12 @@ async def broadcast_confirmation_handler(message: types.Message, state: FSMConte
     message_text = data.get("message_text", "")
     
     if not user_ids or not message_text:
-        await message.answer("Немає користувачів або тексту для розсилки. Скасовано.")
+        sent = await message.answer("Немає користувачів або тексту для розсилки. Скасовано.")
+        await state.update_data(last_bot_message_id=sent.message_id)
         await state.clear()
         return
 
-    await message.answer(f"Починаю розсилку для {len(user_ids)} користувачів...")
+    sent = await message.answer(f"Починаю розсилку для {len(user_ids)} користувачів...")
     
     successful_sends = 0
     failed_sends = 0
@@ -93,9 +106,10 @@ async def broadcast_confirmation_handler(message: types.Message, state: FSMConte
         except Exception:
             failed_sends += 1
             
-    await message.answer(
+    sent = await message.answer(
         f"Розсилку завершено.\n\n"
         f"✅ Успішно надіслано: {successful_sends}\n"
         f"❌ Не вдалося надіслати: {failed_sends}"
     )
+    await state.update_data(last_bot_message_id=sent.message_id)
     await state.clear() 
