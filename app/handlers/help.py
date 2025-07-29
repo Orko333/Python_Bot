@@ -2,21 +2,16 @@ from aiogram import types, Router
 from aiogram.filters import Command
 from app.config import Config
 from aiogram.fsm.context import FSMContext
-from app.utils.validation import delete_previous_messages, delete_all_tracked_messages, is_command
+from app.utils.validation import is_command
 from app.db import log_message
 
 router = Router()
 
 @router.message(Command("help"))
 async def help_handler(message: types.Message, state: FSMContext):
-    await delete_all_tracked_messages(message.bot, message.chat.id, state)
     await state.update_data(last_user_message_id=message.message_id)
     user_id = message.from_user.id
     try:
-        try:
-            await message.delete()
-        except Exception as del_exc:
-            print(f"[WARNING] /help: не вдалося видалити повідомлення: {del_exc}")
         text = (
             "<b>Доступні команди:</b>\n"
             "/start — Головне меню\n"
@@ -39,12 +34,10 @@ async def help_handler(message: types.Message, state: FSMContext):
                 "/promos — Статистика промокодів\n"
                 "/feedbacks — Всі відгуки\n"
             )
-        await delete_all_tracked_messages(message.bot, message.chat.id, state)
         sent = await message.answer(text, parse_mode="HTML")
         await state.update_data(last_bot_message_id=sent.message_id)
         print(f"[INFO] /help: user {user_id} - help sent")
     except Exception as e:
         print(f"[ERROR] /help: user {user_id} - {e}")
-        await delete_all_tracked_messages(message.bot, message.chat.id, state)
         sent = await message.answer("Сталася помилка при отриманні списку команд.")
         await state.update_data(last_bot_message_id=sent.message_id) 

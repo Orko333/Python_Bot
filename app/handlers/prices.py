@@ -2,27 +2,16 @@ from aiogram import types, Router
 from aiogram.filters import Command
 from app.config import ORDER_TYPE_PRICES
 from aiogram.fsm.context import FSMContext
-from app.utils.validation import delete_previous_messages, delete_all_tracked_messages, is_command
+from app.utils.validation import is_command
 from app.db import log_message
 
 router = Router()
 
 @router.message(Command("prices"))
 async def prices_handler(message: types.Message, state: FSMContext):
-    await delete_all_tracked_messages(message.bot, message.chat.id, state)
     await state.update_data(last_user_message_id=message.message_id)
     user_id = message.from_user.id
     try:
-        try:
-            await message.delete()
-        except Exception as del_exc:
-            print(f"[WARNING] /prices: не вдалося видалити повідомлення: {del_exc}")
-        data = await state.get_data()
-        last_info_id = data.get('last_info_message_id')
-        if last_info_id:
-            try:
-                await message.bot.delete_message(message.chat.id, last_info_id)
-            except: pass
         text = "<b>Наші базові розцінки:</b>\n\n"
 
         for code, details in ORDER_TYPE_PRICES.items():

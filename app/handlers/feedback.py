@@ -6,7 +6,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from app.config import Config
 from app.db import add_feedback, get_feedbacks, log_message
-from app.utils.validation import delete_previous_messages, delete_all_tracked_messages, is_command
+from app.utils.validation import is_command
 
 router = Router()
 FEEDBACK_FILE = "feedback.json"
@@ -30,16 +30,9 @@ class FeedbackStates(StatesGroup):
 # Команда для користувача
 @router.message(Command("feedback"))
 async def feedback_start(message: types.Message, state: FSMContext):
-    await delete_all_tracked_messages(message.bot, message.chat.id, state)
     await state.update_data(last_user_message_id=message.message_id)
     user_id = message.from_user.id
     try:
-        # Якщо є message.delete(), обгорнути у try/except
-        # (у feedback_start його немає, але додати для майбутніх змін)
-        try:
-            await message.delete()
-        except Exception as del_exc:
-            print(f"[WARNING] /feedback: не вдалося видалити повідомлення: {del_exc}")
         sent = await message.answer("Залиште, будь ласка, свій відгук про виконане замовлення. Ви можете написати текст і/або оцінку від 1 до 5 зірок (наприклад: 5 ⭐️)")
         await state.update_data(last_bot_message_id=sent.message_id)
         log_message(user_id, message.from_user.username, 'user', message.text, message.chat.id)
@@ -51,7 +44,6 @@ async def feedback_start(message: types.Message, state: FSMContext):
 
 @router.message(FeedbackStates.waiting_for_feedback)
 async def process_feedback(message: types.Message, state: FSMContext):
-    await delete_all_tracked_messages(message.bot, message.chat.id, state)
     await state.update_data(last_user_message_id=message.message_id)
     log_message(message.from_user.id, message.from_user.username, 'user', message.text, message.chat.id)
     if is_command(message.text):

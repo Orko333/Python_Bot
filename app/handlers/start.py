@@ -3,7 +3,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from app.db import add_referral, get_referrals, log_message
-from app.utils.validation import delete_previous_messages, delete_all_tracked_messages, is_command
+from app.utils.validation import is_command
 
 router = Router()
 
@@ -17,20 +17,9 @@ ORDER_TYPES = [
 
 @router.message(Command("start"))
 async def start_handler(message: types.Message, state: FSMContext):
-    await delete_all_tracked_messages(message.bot, message.chat.id, state)
     user_id = message.from_user.id
     try:
         await state.clear()
-        data = await state.get_data()
-        last_info_id = data.get('last_info_message_id')
-        if last_info_id:
-            try:
-                await message.bot.delete_message(message.chat.id, last_info_id)
-            except: pass
-        try:
-            await message.delete()
-        except Exception as del_exc:
-            print(f"[WARNING] /start: не вдалося видалити повідомлення: {del_exc}")
         print(f"[INFO] /start: user {user_id} - state cleared")
         # Handle referral logic
         args = message.text.split()
@@ -60,15 +49,8 @@ async def start_handler(message: types.Message, state: FSMContext):
             ]
         )
         sent = await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
-        await state.update_data(last_bot_message_id=sent.message_id)
         print(f"[INFO] /start: user {user_id} - welcome sent")
     except Exception as e:
-        data = await state.get_data()
-        last_info_id = data.get('last_info_message_id')
-        if last_info_id:
-            try:
-                await message.bot.delete_message(message.chat.id, last_info_id)
-            except: pass
         print(f"[ERROR] /start: user {user_id} - {e}")
         sent = await message.answer("Сталася помилка при старті.")
         await state.update_data(last_bot_message_id=sent.message_id)
@@ -77,12 +59,6 @@ async def start_handler(message: types.Message, state: FSMContext):
 async def privacy_handler(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     try:
-        data = await state.get_data()
-        last_info_id = data.get('last_info_message_id')
-        if last_info_id:
-            try:
-                await message.bot.delete_message(message.chat.id, last_info_id)
-            except: pass
         text = (
             "<b>Політика конфіденційності</b>\n\n"
             "Ми зберігаємо лише ті дані, які необхідні для виконання вашого замовлення: ім'я, username, номер телефону, деталі замовлення.\n"
@@ -94,12 +70,6 @@ async def privacy_handler(message: types.Message, state: FSMContext):
         await state.update_data(last_info_message_id=sent.message_id)
         print(f"[INFO] /privacy: user {user_id} - policy sent")
     except Exception as e:
-        data = await state.get_data()
-        last_info_id = data.get('last_info_message_id')
-        if last_info_id:
-            try:
-                await message.bot.delete_message(message.chat.id, last_info_id)
-            except: pass
         sent = await message.answer("Сталася помилка при отриманні політики.")
         await state.update_data(last_info_message_id=sent.message_id)
 

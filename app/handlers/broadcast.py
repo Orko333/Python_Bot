@@ -3,8 +3,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from app.config import Config
-from app.db import get_orders # We use get_orders to get all users who ever ordered
-from app.utils.validation import delete_previous_messages, delete_all_tracked_messages
+from app.db import get_orders
 
 router = Router()
 
@@ -14,17 +13,12 @@ class BroadcastStates(StatesGroup):
 
 @router.message(Command("broadcast"))
 async def broadcast_start_handler(message: types.Message, state: FSMContext):
-    await delete_all_tracked_messages(message.bot, message.chat.id, state)
     await state.update_data(last_user_message_id=message.message_id)
     user_id = message.from_user.id
     try:
         if user_id not in Config.ADMIN_IDS:
             print(f"[ERROR] /broadcast: user {user_id} - not admin")
             return
-        try:
-            await message.delete()
-        except Exception as del_exc:
-            print(f"[WARNING] /broadcast: не вдалося видалити повідомлення: {del_exc}")
         sent = await message.answer("Введіть текст повідомлення для розсилки:")
         await state.update_data(last_bot_message_id=sent.message_id)
         await state.set_state(BroadcastStates.waiting_for_message)
@@ -36,18 +30,8 @@ async def broadcast_start_handler(message: types.Message, state: FSMContext):
 
 @router.message(BroadcastStates.waiting_for_message)
 async def broadcast_message_handler(message: types.Message, state: FSMContext):
-    await delete_all_tracked_messages(message.bot, message.chat.id, state)
     await state.update_data(last_user_message_id=message.message_id)
     data = await state.get_data()
-    last_bot_message_id = data.get('last_bot_message_id')
-    
-    if last_bot_message_id:
-        try:
-            await message.bot.delete_message(message.chat.id, last_bot_message_id)
-        except: pass
-    try:
-        await message.delete()
-    except: pass
         
     await state.update_data(message_text=message.text)
     
@@ -66,18 +50,9 @@ async def broadcast_message_handler(message: types.Message, state: FSMContext):
 
 @router.message(BroadcastStates.waiting_for_confirmation)
 async def broadcast_confirmation_handler(message: types.Message, state: FSMContext):
-    await delete_all_tracked_messages(message.bot, message.chat.id, state)
     await state.update_data(last_user_message_id=message.message_id)
     data = await state.get_data()
     last_bot_message_id = data.get('last_bot_message_id')
-    
-    if last_bot_message_id:
-        try:
-            await message.bot.delete_message(message.chat.id, last_bot_message_id)
-        except: pass
-    try:
-        await message.delete()
-    except: pass
 
     if message.text.lower() not in ["так", "yes"]:
         sent = await message.answer("Розсилку скасовано.")

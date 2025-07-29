@@ -6,7 +6,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from app.config import Config
 from app.db import add_support_log, log_message
-from app.utils.validation import delete_previous_messages, delete_all_tracked_messages, is_command
+from app.utils.validation import is_command
 
 router = Router()
 SUPPORT_LOG = "support_log.json"
@@ -27,14 +27,9 @@ class SupportStates(StatesGroup):
 # Користувач ініціює підтримку
 @router.message(Command("support"))
 async def support_start(message: types.Message, state: FSMContext):
-    await delete_all_tracked_messages(message.bot, message.chat.id, state)
     await state.update_data(last_user_message_id=message.message_id)
     user_id = message.from_user.id
     try:
-        try:
-            await message.delete()
-        except Exception as del_exc:
-            print(f"[WARNING] /support: не вдалося видалити повідомлення: {del_exc}")
         sent = await message.answer("Напишіть своє питання або уточнення. Менеджер отримає ваше повідомлення і відповість тут у чаті.")
         await state.update_data(last_bot_message_id=sent.message_id)
         log_message(message.from_user.id, message.from_user.username, 'user', message.text, message.chat.id)
@@ -47,7 +42,6 @@ async def support_start(message: types.Message, state: FSMContext):
 # Пересилка повідомлення користувача адміну
 @router.message(SupportStates.waiting_for_message)
 async def support_user_message(message: types.Message, state: FSMContext, bot: Bot):
-    await delete_all_tracked_messages(message.bot, message.chat.id, state)
     await state.update_data(last_user_message_id=message.message_id)
     if is_command(message.text):
         return False
@@ -69,7 +63,6 @@ async def support_dialog_message(message: types.Message, bot: Bot):
             parse_mode="HTML"
         )
     await message.answer("Повідомлення надіслано.", reply_markup=types.ReplyKeyboardRemove())
-    # Немає потреби видаляти, діалог триває
     log_message(message.from_user.id, message.from_user.username, 'user', message.text, message.chat.id)
 
 # Адмін відповідає користувачу через reply

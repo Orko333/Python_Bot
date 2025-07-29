@@ -615,6 +615,7 @@ def log_message(user_id, username, direction, text, chat_id=None, message_type='
                   (user_id, username, direction, text, chat_id, message_type))
         conn.commit()
 
+
 # --- Викликати при старті бота ---
 if __name__ == '__main__':
     init_db() 
